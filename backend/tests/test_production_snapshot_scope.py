@@ -821,3 +821,15 @@ async def test_references_corpus_keeps_core_identity_and_the_exact_source_docume
     assert corpus.production_input_hash == snapshot.input_hash
     assert corpus.schema_version == 1
     assert corpus.research_status is ProductionReferenceResearchStatus.COMPLETED
+
+
+def test_supplemental_warning_redacts_signed_url_parameters() -> None:
+    from cti_app.application.production_workflow import _supplemental_failure_warning
+
+    warning = _supplemental_failure_warning(
+        RuntimeError("boom"),
+        canonical_url="https://u:pw@cdn.example/a?uri=X1&signature=abc123&token=zzz",
+    )
+
+    assert "abc123" not in warning and "zzz" not in warning and ":pw@" not in warning
+    assert "uri=X1" in warning

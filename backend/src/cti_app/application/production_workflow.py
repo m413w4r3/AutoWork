@@ -142,6 +142,7 @@ from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.publication_document import parse_publication_document
 from cti_app.domain.publication_kind import PublicationKind
+from cti_app.logging import redact_sensitive_value
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -228,6 +229,7 @@ def _durable_collection_fields(
         if collection.failure_reason_code is None
         else str(value(collection.failure_reason_code))
     )
+    fields["collection_id"] = str(collection.id)
     fields["attempt_count"] = int(collection.attempt_count)
     fields["latest_attempt_id"] = (
         None if collection.latest_attempt_id is None else str(collection.latest_attempt_id)
@@ -268,6 +270,12 @@ def _supplemental_failure_fields(
     if details:
         fields["details"] = details
     fields["error_type"] = type(exc).__name__
+    # A supplemental publication that cannot be collected is a warning, never a pipeline failure.
+    fields["classification"] = "warning"
+    fields["operation"] = "supplemental_collection"
+    fields["recovery_action"] = (
+        "bounded_retry" if fields.get("retryable") is True else "reacquire_or_replace_source"
+    )
     message = str(exc).strip()
     if message and message != fields.get("error_code"):
         fields["error_message"] = message[:1000]
@@ -284,7 +292,7 @@ def _supplemental_failure_warning(
     details = raw_details if isinstance(raw_details, dict) else {}
     parts = ["supplemental_collection_failed"]
     if canonical_url is not None:
-        parts.append(f"url={canonical_url}")
+        parts.append(f"url={redact_sensitive_value(canonical_url)}")
     code = getattr(exc, "code", None)
     if isinstance(code, str) and code:
         parts.append(f"code={code}")
@@ -1115,6 +1123,7 @@ class ProductionWorkflowOrchestrator:
                                     run_id=run.id,
                                     subject_id=run.subject_id,
                                     stage="references",
+                                    pipeline_generation=run.pipeline_generation,
                                     correlation_id=getattr(self, "_correlation_id", None),
                                     **failure_fields,
                                 )
@@ -1131,6 +1140,7 @@ class ProductionWorkflowOrchestrator:
                         run_id=run.id,
                         subject_id=run.subject_id,
                         stage="references",
+                        pipeline_generation=run.pipeline_generation,
                         correlation_id=getattr(self, "_correlation_id", None),
                         **failure_fields,
                     )
