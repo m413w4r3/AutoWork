@@ -143,10 +143,9 @@ test("lance l’atelier M24 et navigue les cinq vues au clavier", async ({
   await expect(overviewTab).toBeFocused();
   await page.keyboard.press("ArrowLeft");
   await expect(opinionTab).toBeFocused();
-  await expect(page.getByRole("tabpanel")).toHaveAttribute(
-    "aria-labelledby",
-    "workshop-tab-opinion",
-  );
+  await expect(
+    page.getByRole("tabpanel", { name: "Note de l’analyste" }),
+  ).toHaveAttribute("aria-labelledby", "workshop-tab-opinion");
 });
 
 test("cockpit : la tablist est visible sans défilement à 1280×800", async ({
@@ -163,7 +162,6 @@ test("cockpit : la tablist est visible sans défilement à 1280×800", async ({
   const box = await tablist.boundingBox();
   expect(box).not.toBeNull();
   expect(box?.y ?? Number.NEGATIVE_INFINITY).toBeGreaterThanOrEqual(0);
-  expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual(800);
 
   // The launch/list cards above the cockpit are folded, not removed.
   await expect(page.getByText("Synthèse et enquêtes du sujet")).toBeVisible();
@@ -174,7 +172,12 @@ test("cockpit : la tablist est visible sans défilement à 1280×800", async ({
     "Workspace et notes",
     "Note de l’analyste",
   ]) {
-    await expect(tablist.getByRole("tab", { name: label })).toBeVisible();
+    const tab = tablist.getByRole("tab", { name: label });
+    await expect(tab).toBeVisible();
+    const tabBox = await tab.boundingBox();
+    expect(tabBox).not.toBeNull();
+    expect(tabBox?.y ?? Number.NEGATIVE_INFINITY).toBeGreaterThanOrEqual(0);
+    expect((tabBox?.y ?? 0) + (tabBox?.height ?? 0)).toBeLessThanOrEqual(800);
   }
 });
 
@@ -187,6 +190,11 @@ test("vue d’ensemble : agent hôte absent, workspace indisponible et G2 bloqu�
   });
   await launchWorkshop(page, api);
 
+  await page
+    .getByLabel("Détails techniques")
+    .getByText("Détails techniques", { exact: true })
+    .click();
+  await page.getByText("Autorisations / budgets G2", { exact: true }).click();
   await expect(page.getByText("Agent hôte absent")).toBeVisible();
   await expect(
     page.getByText(/Les actions sur le workspace local sont bloquées/),
@@ -225,6 +233,11 @@ test("vue d’ensemble : création du workspace puis approbation G2 explicite", 
   const api = createWorkshopApi({ workspaceState: "unbound" });
   await launchWorkshop(page, api);
 
+  await page
+    .getByLabel("Détails techniques")
+    .getByText("Détails techniques", { exact: true })
+    .click();
+  await page.getByText("Autorisations / budgets G2", { exact: true }).click();
   await expect(page.getByText("Workspace local à créer")).toBeVisible();
   await page.getByRole("button", { name: "Créer le workspace" }).click();
   const workspaceRegion = page.getByRole("region", {
@@ -255,11 +268,24 @@ test("vue d’ensemble : création du workspace puis approbation G2 explicite", 
   await approve.click();
 
   await expect(
-    page.getByText("Enveloppe G2 approuvée — version 1"),
+    page.getByText("Approbation G2 initiale enregistrée"),
+  ).toBeVisible();
+  const initialEnvelope = page.getByRole("region", {
+    name: "Enveloppe G2 initiale",
+  });
+  await initialEnvelope
+    .getByRole("status")
+    .getByText("Détails techniques", { exact: true })
+    .click();
+  await expect(
+    initialEnvelope.getByText("f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1"),
   ).toBeVisible();
   await expect(
-    page.getByText(/Décision f1f1f1f1-f1f1-41f1-81f1-f1f1f1f1f1f1/),
-  ).toBeVisible();
+    initialEnvelope
+      .locator("dt")
+      .filter({ hasText: "Version de l’enveloppe" })
+      .locator("xpath=following-sibling::dd"),
+  ).toHaveText("1");
 
   const lifecycle = page.getByRole("region", {
     name: "Cycle de vie de l’enveloppe G2",
@@ -305,13 +331,23 @@ test("vue d’ensemble : extension puis révocation G2 de l’enveloppe approuv�
   await page
     .getByRole("button", { name: "Ouvrir l’enquête sur cette version" })
     .click();
+  await page.getByText("Autorisations / budgets G2", { exact: true }).click();
 
   const lifecycle = page.getByRole("region", {
     name: "Cycle de vie de l’enveloppe G2",
   });
   await expect(lifecycle).toBeVisible();
   await expect(
-    lifecycle.getByText("Enveloppe G2 active — version 1"),
+    lifecycle.getByText("Accès externes : actifs", { exact: true }),
+  ).toBeVisible();
+  const envelopeTechnicalDetails = lifecycle
+    .locator("details")
+    .filter({ hasText: "Version de l’enveloppe" });
+  await envelopeTechnicalDetails
+    .getByText("Détails techniques", { exact: true })
+    .click();
+  await expect(
+    envelopeTechnicalDetails.getByText("1", { exact: true }),
   ).toBeVisible();
   await expect(
     lifecycle.getByRole("button", { name: /Approuver/ }),
@@ -325,7 +361,10 @@ test("vue d’ensemble : extension puis révocation G2 de l’enveloppe approuv�
     .getByRole("button", { name: "Confirmer l’extension" })
     .click();
   await expect(
-    lifecycle.getByText("Enveloppe étendue — version 2"),
+    lifecycle.getByText("Enveloppe étendue", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    envelopeTechnicalDetails.getByText("2", { exact: true }),
   ).toBeVisible();
 
   const extension = api.requests.find(
@@ -364,7 +403,12 @@ test("vue d’ensemble : extension puis révocation G2 de l’enveloppe approuv�
   await dialog.getByRole("button", { name: "Confirmer la révocation" }).click();
 
   await expect(
-    lifecycle.getByText("Enveloppe révoquée — droits externes coupés"),
+    lifecycle.getByText("Accès externes : révoqués", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    lifecycle.getByText(
+      /Aucune nouvelle opération VT, Shodan ou Bridge externe n’est autorisée/,
+    ),
   ).toBeVisible();
   await expect(
     lifecycle.getByRole("button", { name: /Approuver/ }),
@@ -402,7 +446,8 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   ).toBeVisible();
   await expect(page.getByText("Piste 1 — Analyser le dropper")).toBeVisible();
 
-  const timeline = page.getByRole("region", { name: "Chronologie commune" });
+  await page.getByText("Activité globale", { exact: true }).first().click();
+  const timeline = page.getByRole("region", { name: "Activité globale" });
   const entries = [
     [
       "Passation v1 · Humain → Opérateur",
@@ -416,16 +461,17 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
       "agent_session:codex_cli:running",
     ],
     [
-      "Instruction humaine · En file (agent occupé)",
-      "Instruction humaine",
+      "Instruction humaine · En file",
+      "Instruction humaine · En file",
       "instruction:queued",
     ],
   ] as const;
   for (const [sentence, label, raw] of entries) {
     const entry = timeline.getByRole("listitem").filter({ hasText: sentence });
     await expect(entry.getByText(label, { exact: true })).toBeVisible();
-    // The raw projection token stays readable as the item title.
-    await expect(entry.getByTitle(raw)).toHaveText(sentence);
+    await entry.getByText("Détails techniques", { exact: true }).click();
+    // The raw projection token stays visible in the technical details.
+    await expect(entry.getByText(raw, { exact: true })).toBeVisible();
   }
   await expect(
     timeline.getByText("Non probant — élément de travail"),
@@ -437,6 +483,7 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   const decisionEntry = timeline
     .getByRole("listitem")
     .filter({ hasText: "Approbation d’un pivot" });
+  await decisionEntry.getByText("Détails techniques", { exact: true }).click();
   await expect(decisionEntry.getByText("Type de cible")).toBeVisible();
   await expect(decisionEntry.getByText("pivot", { exact: true })).toBeVisible();
   await expect(decisionEntry.getByTitle(workshopIds.sample)).toHaveText(
@@ -448,12 +495,13 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
     .getByRole("listitem")
     .filter({ hasText: "Téléchargement d’un échantillon VT" });
   await expect(toolEntry.getByText("Opérateur · Codex CLI")).toBeVisible();
+  await toolEntry.getByText("Détails techniques", { exact: true }).click();
   await expect(toolEntry.getByText("Clé d’opération")).toBeVisible();
   await expect(toolEntry.getByText("operator:digest:payload")).toBeVisible();
 
   await page.getByLabel(/Type d’événement/).selectOption("instruction");
   await expect(
-    timeline.getByText("Instruction humaine · En file (agent occupé)"),
+    timeline.getByText("Instruction humaine · En file"),
   ).toBeVisible();
   await expect(
     timeline.getByText("Passation v1 · Humain → Opérateur"),
@@ -485,6 +533,9 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
     .getByRole("article")
     .filter({ hasText: "Pivoter sur l’infrastructure" });
   await expect(readyCard).toBeVisible();
+  await page
+    .getByRole("button", { name: /Pivoter sur l’infrastructure, Proposée/ })
+    .click();
   await expect(proposedCard).toBeVisible();
 
   const proposedActions = page.getByRole("group", {
@@ -498,8 +549,19 @@ test("plan et tâches : acceptation, action absente et CAS périmé", async ({
   ).toHaveCount(0);
   await expect(
     proposedActions.getByRole("button", { name: "Annuler la tâche" }),
+  ).toHaveCount(0);
+  await proposedCard.getByText("Plus d’actions", { exact: true }).click();
+  await expect(
+    page
+      .getByRole("group", {
+        name: "Actions secondaires pour Pivoter sur l’infrastructure",
+      })
+      .getByRole("button", { name: "Annuler la tâche" }),
   ).toBeVisible();
 
+  await page
+    .getByRole("button", { name: /Vérifier le domaine C2, Prête/ })
+    .click();
   await readyCard
     .getByRole("button", { name: "Je prends cette tâche" })
     .click();
@@ -540,6 +602,7 @@ test("demander à Bridge depuis une tâche : avis consultatif, registre et aucun
     .getByRole("article")
     .filter({ hasText: "Vérifier le domaine C2" });
   await expect(card).toBeVisible();
+  await card.getByRole("tab", { name: "Agent et messages" }).click();
   await card.getByRole("button", { name: "Demander à Bridge" }).click();
   await expect(
     card.getByText(/ni résultat de tâche, ni preuve, ni décision/),
@@ -624,32 +687,50 @@ test("échantillons et résultats : inventaire, statuts et candidats jusqu’à 
   await openView(page, "Échantillons et résultats");
 
   await expect(
-    page.getByRole("heading", { name: "Inventaire IOC" }),
+    page.getByRole("heading", { name: "IOC et échantillons" }),
+  ).toBeVisible();
+  const inventoryTable = page.getByRole("table", {
+    name: "Inventaire filtré — 2 ligne(s)",
+  });
+  await expect(inventoryTable).toBeVisible();
+  await expect(
+    inventoryTable.getByRole("cell", { name: "Seed — déjà dans l’article" }),
   ).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: "Seeds — déjà dans l’article" }),
-  ).toBeVisible();
+    inventoryTable.getByRole("cell", {
+      name: "Découvert — pivot à qualifier",
+    }),
+  ).toHaveCount(2);
   await expect(
-    page.getByRole("heading", { name: "Découverts — pivots" }),
+    inventoryTable.getByRole("cell", {
+      name: "Candidat — décision G3 humaine requise",
+    }),
   ).toBeVisible();
+  const sampleHash = "d".repeat(64);
+  const sampleRow = inventoryTable
+    .getByRole("row")
+    .filter({ hasText: sampleHash });
+  await sampleRow.getByRole("button", { name: "Détail" }).click();
+  const sampleDetail = page.getByRole("region", {
+    name: `Détail de ${sampleHash}`,
+  });
+  await expect(sampleDetail).toBeVisible();
   await expect(
-    page.getByRole("table", { name: /Seeds — déjà dans l’article/ }),
+    sampleDetail.getByText("Candidat — décision G3 humaine requise", {
+      exact: true,
+    }),
   ).toBeVisible();
+  await expect(sampleDetail.getByText(/En quarantaine/)).toBeVisible();
   await expect(
-    page.getByText("Candidat — décision G3 humaine requise").first(),
+    sampleDetail.getByText(/Téléchargé et haché vérifié/),
   ).toBeVisible();
-  await expect(page.getByText("En quarantaine").first()).toBeVisible();
-  await expect(
-    page.getByText(/Téléchargé et haché vérifié/).first(),
-  ).toBeVisible();
+  await page
+    .getByText("Historique et décision humaine G3", { exact: true })
+    .click();
+  await expect(page.getByLabel(/Décision G3 pour/)).toBeVisible();
   await expect(
     page.getByText(
-      /une qualification « candidat » reste soumise à une décision G3 humaine/,
-    ),
-  ).toBeVisible();
-  await expect(
-    page.getByText(
-      /Un nouvel échantillon reste candidat jusqu’à une confirmation G3 humaine/,
+      /acquisition ≠ confirmation · aucune automatisation ne promeut un candidat/,
     ),
   ).toBeVisible();
   await expect(
@@ -670,6 +751,18 @@ test("échantillons : qualification G3 motivée avec observation de l’enquête
   await launchWorkshop(page, api);
   await openView(page, "Échantillons et résultats");
 
+  const sampleHash = "d".repeat(64);
+  const inventoryTable = page.getByRole("table", {
+    name: "Inventaire filtré — 2 ligne(s)",
+  });
+  await inventoryTable
+    .getByRole("row")
+    .filter({ hasText: sampleHash })
+    .getByRole("button", { name: "Détail" })
+    .click();
+  await page
+    .getByText("Historique et décision humaine G3", { exact: true })
+    .click();
   await expect(
     page.getByRole("heading", { name: "Qualification G3 des échantillons" }),
   ).toBeVisible();
@@ -737,6 +830,7 @@ test("attribution : passation honnête, ouverture masquée sans agent hôte", as
       /Passation v1 créée pour Codex CLI — aucune session ouverte pour l’instant/,
     ),
   ).toBeVisible();
+  await readyCard.getByRole("tab", { name: "Agent et messages" }).click();
   await expect(
     readyCard.getByRole("button", { name: "Ouvrir la session Codex CLI" }),
   ).toHaveCount(0);
@@ -767,12 +861,21 @@ test("attribution : passation honnête, ouverture masquée sans agent hôte", as
 
   await openView(page, "Workspace et notes");
   await page
-    .getByRole("button", { name: /notes\/humaines\/hypothese\.md/ })
+    .getByRole("region", { name: "Dossiers et fichiers" })
+    .getByRole("button", { name: /Note humaine · 22 nov\. 2026/ })
+    .filter({ hasText: "hypothese.md" })
+    .click();
+  await page
+    .getByRole("region", { name: "Contenu sélectionné" })
+    .getByRole("button", { name: "Associer à une tâche" })
     .click();
   await expect(
-    page.getByLabel("Lier à une tâche").locator("option", {
-      hasText: "lead-a · Vérifier le domaine C2",
-    }),
+    page
+      .getByRole("region", { name: "Contenu sélectionné" })
+      .getByLabel("Lier à une tâche")
+      .locator("option", {
+        hasText: "lead-a · Vérifier le domaine C2 · Attribuée",
+      }),
   ).toHaveCount(1);
   expect(api.unhandled).toEqual([]);
 });
@@ -792,6 +895,7 @@ test("attribution puis ouverture explicite de la session Codex", async ({
     .getByRole("article")
     .filter({ hasText: "Vérifier le domaine C2" });
   await readyCard.getByRole("button", { name: "Attribuer à Codex" }).click();
+  await readyCard.getByRole("tab", { name: "Agent et messages" }).click();
 
   const openButton = readyCard.getByRole("button", {
     name: "Ouvrir la session Codex CLI",
@@ -817,12 +921,16 @@ test("attribution puis ouverture explicite de la session Codex", async ({
   });
   expect(open?.idempotencyKey).toBeTruthy();
 
+  await page.getByRole("button", { name: "Sessions actives (1)" }).click();
+  const agentContext = readyCard.getByRole("region", {
+    name: "Contexte agent de la tâche",
+  });
   await expect(
-    page.getByText("Codex CLI · Vérifier le domaine C2"),
+    agentContext.getByRole("heading", { name: "Codex CLI — En cours" }),
   ).toBeVisible();
-  const operators = page.getByRole("region", { name: "Opérateurs actifs" });
-  await expect(operators.getByText("En cours").first()).toBeVisible();
-  await expect(page.getByText("Aucun opérateur actif.")).toHaveCount(0);
+  await expect(
+    agentContext.getByText("Tâche : Vérifier le domaine C2"),
+  ).toBeVisible();
   expect(api.unhandled).toEqual([]);
 });
 
@@ -844,6 +952,7 @@ test("ouverture de session refusée par la divulgation externe", async ({
     .getByRole("article")
     .filter({ hasText: "Vérifier le domaine C2" });
   await readyCard.getByRole("button", { name: "Attribuer à Codex" }).click();
+  await readyCard.getByRole("tab", { name: "Agent et messages" }).click();
   await readyCard
     .getByRole("button", { name: "Ouvrir la session Codex CLI" })
     .click();
@@ -851,7 +960,11 @@ test("ouverture de session refusée par la divulgation externe", async ({
   await expect(readyCard.getByRole("alert")).toContainText(
     /Divulgation externe refusée/,
   );
-  await expect(page.getByText("Aucun opérateur actif.")).toBeVisible();
+  await expect(
+    readyCard
+      .getByRole("region", { name: "Contexte agent de la tâche" })
+      .getByText("Aucune session active pour cette tâche."),
+  ).toBeVisible();
   expect(
     api.requests.filter(
       (request) =>
@@ -871,10 +984,12 @@ test("workspace et notes : arborescence, note non vérifiée et résolution de c
   await openView(page, "Workspace et notes");
 
   await expect(
-    page.getByRole("heading", { name: "Arborescence et fichiers" }),
+    page.getByRole("heading", { name: "Dossiers / fichiers" }),
   ).toBeVisible();
   await page
-    .getByRole("button", { name: /notes\/humaines\/hypothese\.md/ })
+    .getByRole("region", { name: "Dossiers et fichiers" })
+    .getByRole("button", { name: /Note humaine · 22 nov\. 2026/ })
+    .filter({ hasText: "hypothese.md" })
     .click();
   await expect(page.getByText("Note de travail — non probante")).toBeVisible();
   await expect(
@@ -886,16 +1001,18 @@ test("workspace et notes : arborescence, note non vérifiée et résolution de c
 
   // M6 : aucune session active dans ce scénario, l’instruction agent est
   // proposée avec une raison explicite et reste désactivée.
+  await page.getByRole("button", { name: "Envoyer à l’agent" }).click();
   await expect(
     page.getByText(
       /Action indisponible : aucune session active pour cette tâche/,
     ),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Demander à l’agent de continuer" }),
+    page.getByRole("button", { name: "Transmettre l’instruction" }),
   ).toBeDisabled();
 
   // M1 : la relecture Bridge utilise la version d’état de travail lue.
+  await page.getByRole("button", { name: "Demander à Bridge" }).click();
   await page
     .getByLabel("Question à Bridge sur cette note")
     .fill("La note est-elle cohérente avec l’observation ?");
@@ -917,10 +1034,11 @@ test("workspace et notes : arborescence, note non vérifiée et résolution de c
   expect(bridge?.idempotencyKey).toBeTruthy();
   await expect(page.getByText(/avis consultatif — non probant/)).toBeVisible();
 
-  await expect(
-    page.getByRole("heading", { name: "Conflits", exact: true }),
-  ).toBeVisible();
-  const conflict = page.getByRole("article", {
+  const conflicts = page.getByRole("region", {
+    name: "Conflits du workspace",
+  });
+  await conflicts.getByText("Conflits — 1 non résolu", { exact: true }).click();
+  const conflict = conflicts.getByRole("article", {
     name: "Conflit sur notes/humaines/hypothese.md",
   });
   await expect(conflict).toBeVisible();
@@ -959,22 +1077,30 @@ test("note de l’analyste : deux ancres, proposition Bridge acceptée par hash"
   await launchWorkshop(page, api);
   await openView(page, "Note de l’analyste");
 
-  const notesRegion = page.getByRole("region", { name: "Notes par ancre" });
-  await expect(notesRegion).toBeVisible();
+  const analystView = page.getByRole("tabpanel", {
+    name: "Note de l’analyste",
+  });
+  const notesPanel = analystView.getByRole("tabpanel", { name: "Notes 2" });
+  await notesPanel.getByText("Notes existantes (2)", { exact: true }).click();
   await expect(
-    notesRegion.getByRole("heading", { name: /Ancre lead:0001 · 1 note/ }),
+    notesPanel.getByRole("heading", { name: "Notes par ancre" }),
   ).toBeVisible();
   await expect(
-    notesRegion.getByRole("heading", {
-      name: /Ancre section:2:paragraph:0007 · 1 note/,
+    notesPanel.getByRole("heading", {
+      name: "Chapô, paragraphe 1 · 1 note",
+    }),
+  ).toBeVisible();
+  await expect(
+    notesPanel.getByRole("heading", {
+      name: "Section 3, paragraphe 7 · 1 note",
     }),
   ).toBeVisible();
   await expect(page.getByText("Rédigée par Bridge").first()).toBeVisible();
   await expect(
-    page.getByText(
-      /Aucun champ ne permet de saisir du texte éditorial de l’avis/,
-    ),
-  ).toBeVisible();
+    page.getByRole("textbox", {
+      name: /(texte|proposition).*(avis|note|bloc)/i,
+    }),
+  ).toHaveCount(0);
 
   const requestButton = page.getByRole("button", {
     name: "Demander à Bridge",
@@ -1000,13 +1126,17 @@ test("note de l’analyste : deux ancres, proposition Bridge acceptée par hash"
   });
   expect(request?.idempotencyKey).toBeTruthy();
 
+  const proposalReview = page.getByRole("region", {
+    name: "Proposition Bridge — version 4",
+  });
+  await expect(proposalReview).toBeVisible();
   await expect(
-    page.getByRole("heading", {
-      name: /Proposition ciblée · ancre lead:0001/,
+    proposalReview.getByText("Chapô, paragraphe 1 · « Extrait du chapô. »", {
+      exact: true,
     }),
   ).toBeVisible();
   await expect(
-    page.getByText("Texte Bridge proposé pour le chapô.").first(),
+    proposalReview.getByText("Texte Bridge proposé pour le chapô.").first(),
   ).toBeVisible();
   const editableValues = await page
     .locator("textarea, input")
@@ -1018,17 +1148,19 @@ test("note de l’analyste : deux ancres, proposition Bridge acceptée par hash"
     );
   expect(editableValues).not.toContain("Texte Bridge proposé pour le chapô.");
 
-  await page.getByLabel(/J’ai examiné le texte stocké/).check();
-  const accept = page.getByRole("button", {
-    name: /Accepter la proposition v4 · SHA-256 222222222222/,
-  });
+  await proposalReview
+    .getByLabel(
+      "J’ai relu ce texte et ses références ; je confirme qu’il peut être publié à cet emplacement.",
+    )
+    .check();
+  const accept = proposalReview.getByRole("button", { name: "Accepter" });
   await expect(accept).toBeEnabled();
   await accept.click();
 
   await expect(
     page.getByRole("heading", { name: "Note acceptée" }),
   ).toBeVisible();
-  await expect(page.getByText(/Avis v4 · SHA-256 555555555555/)).toBeVisible();
+  await expect(page.getByText(/Avis v4 enregistré/)).toBeVisible();
   const acceptance = api.requests.find(
     (item) =>
       item.method === "POST" &&
@@ -1053,6 +1185,7 @@ test("note de l’analyste : une proposition périmée n’est pas acceptable", 
   await launchWorkshop(page, api);
   await openView(page, "Note de l’analyste");
 
+  await page.getByRole("tab", { name: "Propositions 1" }).click();
   const proposalsRegion = page.getByRole("region", {
     name: "Propositions Bridge",
   });
@@ -1069,7 +1202,9 @@ test("note de l’analyste : une proposition périmée n’est pas acceptable", 
     page.getByText(/Son texte ne peut plus être accepté/),
   ).toBeVisible();
   await expect(
-    page.getByRole("button", { name: /Accepter la proposition v5/ }),
+    page
+      .getByRole("region", { name: "Proposition Bridge — version 5" })
+      .getByRole("button", { name: "Accepter" }),
   ).toBeDisabled();
   expect(api.requests.filter((item) => item.path.endsWith("/accept"))).toEqual(
     [],
@@ -1089,16 +1224,23 @@ test("note de l’analyste : blocs de contenu référencés puis vérifiés", as
   });
   await expect(requestButton).toBeEnabled();
 
-  const elementSelect = page.getByLabel("Élément à référencer");
+  await page
+    .getByText("Qualification et contenu vérifiable", { exact: true })
+    .click();
+  const elementPicker = page.getByRole("group", {
+    name: "Élément à référencer",
+  });
   await expect(
-    elementSelect.getByRole("option", {
-      name: /Volume des commandes.*non proposable : graphique sans preuve/,
+    elementPicker.getByRole("radio", {
+      name: /Volume des commandes.*Non proposable : graphique sans preuve/i,
     }),
   ).toBeDisabled();
   await expect(
     page.getByText(/Un élément M23 de cette ancre est grisé/),
   ).toBeVisible();
-  await elementSelect.selectOption("table:table-commands");
+  await elementPicker
+    .getByRole("radio", { name: "Commandes observées" })
+    .check();
   await page.getByRole("button", { name: "Référencer cet élément" }).click();
 
   const ioc = page.getByRole("group", {
@@ -1143,20 +1285,26 @@ test("note de l’analyste : blocs de contenu référencés puis vérifiés", as
   });
   await expect(resolved.getByText(/Commandes observées/)).toBeVisible();
   await expect(
-    resolved.getByText(/cross-référence vers l’ancre/),
+    resolved.getByText(
+      /cross-référence vers le paragraphe correspondant de l’article/,
+    ),
   ).toBeVisible();
   await expect(
     resolved.getByRole("table", { name: "Tableau IOC (1)" }),
   ).toBeVisible();
-  const review = page.getByRole("region", { name: /Proposition ciblée/ });
+  const review = page.getByRole("region", {
+    name: "Proposition Bridge — version 4",
+  });
   await expect(
     review.getByRole("link", { name: "Ouvrir dans l’atelier éditorial" }),
   ).toHaveAttribute("href", `/subjects/${api.ids.subject}/editor`);
 
-  await page.getByLabel(/J’ai examiné le texte stocké/).check();
-  await page
-    .getByRole("button", { name: /Accepter la proposition v4/ })
-    .click();
+  await review
+    .getByLabel(
+      "J’ai relu ce texte et ses références ; je confirme qu’il peut être publié à cet emplacement.",
+    )
+    .check();
+  await review.getByRole("button", { name: "Accepter" }).click();
   await expect(
     page.getByRole("heading", { name: "Note acceptée" }),
   ).toBeVisible();
@@ -1179,20 +1327,33 @@ test("note de l’analyste : aucune largeur ne déborde aux trois résolutions",
   await openView(page, "Note de l’analyste");
 
   // The widest realistic value is the bootstrap observation option: a long
-  // object type, a full UUID object id and a dotted source. Its short label is
-  // shown, the full identity stays in the option title.
-  const observationSelect = page.getByLabel("Observation source");
-  const longOption = observationSelect.locator(
-    `option[value="${workshopIds.longObservation}"]`,
-  );
-  await expect(longOption).toHaveAttribute(
-    "title",
-    /investigation\.bootstrap_snapshot/,
-  );
+  // object type, full UUID object id and dotted source. Its visible label is
+  // truncated; the full identity remains in its technical provenance.
+  await page
+    .getByText("Qualification et contenu vérifiable", { exact: true })
+    .click();
+  const observationPicker = page.getByRole("group", {
+    name: "Observation source",
+  });
+  const longSource = observationPicker.getByRole("region", {
+    name: "Source investigation.bootstrap",
+  });
+  await expect(
+    longSource.getByRole("radio", {
+      name: /Autre observation · investigation\.bootstrap_snapshot\/66d328b0-1…/,
+    }),
+  ).toBeVisible();
+  await longSource.locator("summary").click();
+  await expect(
+    longSource.getByText("66d328b0-1a2b-4c3d-8e4f-5a6b7c8d9e0f", {
+      exact: true,
+    }),
+  ).toBeVisible();
 
+  await page.getByRole("tab", { name: "Propositions 1" }).click();
   await page.getByRole("button", { name: "Examiner la proposition" }).click();
   await expect(
-    page.getByRole("region", { name: /Proposition ciblée/ }),
+    page.getByRole("region", { name: "Proposition Bridge — version 4" }),
   ).toBeVisible();
   // The read-only IOC table (full UUID observation ids) is rendered too.
   await expect(
@@ -1239,36 +1400,30 @@ test("cases à cocher et radios : le contrôle reste collé au libellé", async 
 }) => {
   const api = createWorkshopApi();
   await launchWorkshop(page, api);
+  await page.getByText("Autorisations / budgets G2", { exact: true }).click();
+  await expect(
+    page
+      .locator("label.workshop-approval-form__confirm")
+      .filter({ hasText: "Je confirme approuver l’enveloppe G2" }),
+  ).toBeVisible();
+  await expect(
+    page
+      .locator("label.workshop-approval-form__confirm")
+      .filter({ hasText: "Je confirme approuver l’enveloppe G2" }),
+  ).toHaveCSS("display", "flex");
 
   const inlineChoices = async () =>
-    page
-      .locator(
-        "label:has(> input[type='checkbox']), label:has(> input[type='radio'])",
-      )
-      .evaluateAll((labels) =>
-        labels.map((label) => {
-          const element = label as unknown as {
-            querySelector(selector: string): {
-              getBoundingClientRect(): Box;
-            } | null;
-            getBoundingClientRect(): Box;
-            textContent: string | null;
-          };
-          const input = element.querySelector(
-            "input[type='checkbox'], input[type='radio']",
-          );
-          if (input === null) throw new Error("label without control");
-          const labelRect = element.getBoundingClientRect();
-          const inputRect = input.getBoundingClientRect();
-          return {
-            text: (element.textContent ?? "").trim().slice(0, 48),
-            inputWidth: Math.round(inputRect.width),
-            inputHeight: Math.round(inputRect.height),
-            offsetFromLabel: Math.round(inputRect.left - labelRect.left),
-            topFromLabel: Math.round(inputRect.top - labelRect.top),
-          };
-        }),
-      );
+    page.evaluate<
+      Array<{
+        text: string;
+        inputWidth: number;
+        inputHeight: number;
+        offsetFromLabel: number;
+        topFromLabel: number;
+      }>
+    >(
+      "[...document.querySelectorAll(\"label:has(> input[type='checkbox']), label:has(> input[type='radio'])\")].filter(label => { const rect = label.getBoundingClientRect(); return rect.width > 0 && rect.height > 0; }).map(label => { const input = label.querySelector(\"input[type='checkbox'], input[type='radio']\"); if (!input) throw new Error('label without control'); const labelRect = label.getBoundingClientRect(); const inputRect = input.getBoundingClientRect(); return { text: (label.textContent ?? '').trim().slice(0, 48), inputWidth: Math.round(inputRect.width), inputHeight: Math.round(inputRect.height), offsetFromLabel: Math.round(inputRect.left - labelRect.left), topFromLabel: Math.round(inputRect.top - labelRect.top) }; })",
+    );
 
   // Another view (G2 envelope approval confirmation) uses the same inline
   // pattern and must not regress either.
@@ -1281,14 +1436,30 @@ test("cases à cocher et radios : le contrôle reste collé au libellé", async 
   }
 
   await openView(page, "Note de l’analyste");
-  await page.getByRole("button", { name: "Examiner la proposition" }).click();
-  await expect(
-    page.getByRole("region", { name: /Proposition ciblée/ }),
-  ).toBeVisible();
+  await page
+    .getByText("Qualification et contenu vérifiable", { exact: true })
+    .click();
+  const opinionChoices = await inlineChoices();
+  // The current expanded request view has 13 choices; the acceptance checkbox
+  // is measured separately in the proposal review panel below.
+  expect(opinionChoices.length).toBe(13);
+  for (const choice of opinionChoices) {
+    expect(choice.inputWidth, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.inputHeight, choice.text).toBeLessThanOrEqual(24);
+    expect(choice.offsetFromLabel, choice.text).toBeLessThanOrEqual(4);
+  }
 
-  const acceptance = page
-    .locator("label")
-    .filter({ hasText: "J’ai examiné le texte stocké" });
+  await page.getByRole("tab", { name: "Propositions 1" }).click();
+  await page.getByRole("button", { name: "Examiner la proposition" }).click();
+  const proposalReview = page.getByRole("region", {
+    name: "Proposition Bridge — version 4",
+  });
+  await expect(proposalReview).toBeVisible();
+
+  const acceptance = proposalReview.locator("label").filter({
+    hasText:
+      "J’ai relu ce texte et ses références ; je confirme qu’il peut être publié à cet emplacement.",
+  });
   await expect(acceptance.getByRole("checkbox")).toBeVisible();
   const acceptanceMetrics = await acceptance.evaluate((label) => {
     const element = label as unknown as {
@@ -1312,14 +1483,6 @@ test("cases à cocher et radios : le contrôle reste collé au libellé", async 
   expect(acceptanceMetrics.inputHeight).toBeLessThanOrEqual(24);
   expect(acceptanceMetrics.offsetFromLabel).toBeLessThanOrEqual(4);
   expect(acceptanceMetrics.topFromLabel).toBeLessThanOrEqual(4);
-
-  const opinionChoices = await inlineChoices();
-  expect(opinionChoices.length).toBeGreaterThanOrEqual(15);
-  for (const choice of opinionChoices) {
-    expect(choice.inputWidth, choice.text).toBeLessThanOrEqual(24);
-    expect(choice.inputHeight, choice.text).toBeLessThanOrEqual(24);
-    expect(choice.offsetFromLabel, choice.text).toBeLessThanOrEqual(4);
-  }
 });
 
 test("note de l’analyste : des blocs périmés bloquent l’acceptation", async ({
@@ -1339,19 +1502,27 @@ test("note de l’analyste : des blocs périmés bloquent l’acceptation", asyn
   await launchWorkshop(page, api);
   await openView(page, "Note de l’analyste");
 
+  await page.getByRole("tab", { name: "Propositions 1" }).click();
   await page.getByRole("button", { name: "Examiner la proposition" }).click();
+  const proposalReview = page.getByRole("region", {
+    name: "Proposition Bridge — version 4",
+  });
 
-  const alert = page.getByRole("alert").filter({
+  const alert = proposalReview.getByRole("alert").filter({
     hasText: /Un élément d’article référencé a changé/,
   });
   await expect(alert).toBeVisible();
   await expect(alert).toContainText("note_block_ref_stale");
-  await page.getByLabel(/J’ai examiné le texte stocké/).check();
+  await proposalReview
+    .getByLabel(
+      "J’ai relu ce texte et ses références ; je confirme qu’il peut être publié à cet emplacement.",
+    )
+    .check();
   await expect(
-    page.getByRole("button", { name: /Accepter la proposition v4/ }),
+    proposalReview.getByRole("button", { name: "Accepter" }),
   ).toBeDisabled();
 
-  await page.getByRole("button", { name: "Recharger la proposition" }).click();
+  await alert.getByRole("button", { name: "Recharger la proposition" }).click();
   await expect
     .poll(
       () =>
