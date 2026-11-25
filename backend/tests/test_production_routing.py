@@ -46,6 +46,7 @@ from cti_app.domain.production_relevance import (
     relevance_projection_to_json,
 )
 from cti_app.domain.production_routing import (
+    ROUTING_POLICY_VERSION,
     ProductionRoutingArtifactInputV1,
     RoutingCriticalSourceDiagnosticV1,
     RoutingReasonCode,
@@ -364,11 +365,76 @@ def test_routing_article_brief_scenarios(extraction, decisions, expected_kind, e
     assert decision.reason_code is expected_reason
 
 
+def test_core_archived_direct_source_does_not_require_review():
+    extraction = _extraction()
+    direct_source = replace(
+        extraction.sources[0],
+        acquisition_method=SourceAcquisitionMethod.DIRECT_HTTP,
+    )
+    extraction = replace(extraction, sources=(direct_source,))
+
+    decision = _inputs(extraction, _projection(extraction))
+
+    assert decision.status is RoutingStatus.DECIDED
+    assert decision.publication_kind is PublicationKind.BRIEF
+    assert decision.reason_code is RoutingReasonCode.NO_SUBJECT_IOC
+    assert decision.critical_source_diagnostics == ()
+
+
+@pytest.mark.parametrize(
+    "method",
+    (
+        SourceAcquisitionMethod.INDEPENDENT_CORROBORATION,
+        SourceAcquisitionMethod.BRIDGE_TRANSCRIPTION,
+        SourceAcquisitionMethod.VISUAL_OCR,
+        SourceAcquisitionMethod.THIRD_PARTY_EXTRACTION,
+    ),
+)
+@pytest.mark.parametrize("confirmed_ioc", (False, True))
+def test_alternative_core_provenance_has_distinct_reason_and_diagnostic(method, confirmed_ioc):
+    indicators = (_indicator("derived.example"),) if confirmed_ioc else ()
+    extraction = _extraction(indicators=indicators)
+    source = replace(extraction.sources[0], acquisition_method=method)
+    extraction = replace(extraction, sources=(source,))
+    decisions = (
+        {
+            "derived.example": (
+                RelevanceClassification.DIRECT,
+                RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+            )
+        }
+        if confirmed_ioc
+        else None
+    )
+
+    decision = _inputs(extraction, _projection(extraction, decisions=decisions))
+
+    assert decision.status is RoutingStatus.NEEDS_REVIEW
+    assert decision.publication_kind is None
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE
+    assert decision.confirmed_ioc_count == int(confirmed_ioc)
+    diagnostic = decision.critical_source_diagnostics[0]
+    assert diagnostic.source_id == str(source.source_document_id)
+    assert diagnostic.source_url == source.canonical_url
+    assert diagnostic.tier == ProductionReferenceTier.CORE.value
+    assert diagnostic.criticality is ProductionSourceCriticality.CRITICAL
+    assert diagnostic.criticality_reason == ProductionSourceCriticalityReason.CORE_TIER.value
+    assert diagnostic.editorial_role is source.editorial_role
+    assert diagnostic.acquisition_method is method
+    assert diagnostic.omission_collection_state is None
+    assert diagnostic.omission_error_code is None
+    assert diagnostic.to_json()["collection_state"] is None
+    assert diagnostic.to_json()["error_code"] is None
+    assert diagnostic.to_json()["remaining_control_code"] == "human_review_required"
+    assert diagnostic.to_json()["human_waiver_path"] == "not_consumed_by_routing"
+    assert decision.policy_version == "subject-publication-routing-v3-routing-reasons-v1"
+
+
 def test_critical_source_omission_needs_review_with_explicit_diagnostic():
     omission = ProductionExtractionOmissionV1(
         canonical_url="https://critical.example/report",
         tier=ProductionReferenceTier.CORE,
-        collection_state=CollectionState.ARCHIVED,
+        collection_state=CollectionState.BLOCKED,
         reason=ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
         error_code=None,
     )
@@ -376,8 +442,100 @@ def test_critical_source_omission_needs_review_with_explicit_diagnostic():
     decision = _inputs(extraction, _projection(extraction))
     assert decision.status is RoutingStatus.NEEDS_REVIEW
     assert decision.publication_kind is None
-    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
-    assert decision.critical_source_diagnostics[0].source_url == omission.canonical_url
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_INACCESSIBLE
+    diagnostic = decision.critical_source_diagnostics[0]
+    assert diagnostic.source_url == omission.canonical_url
+    assert diagnostic.omission_collection_state is CollectionState.BLOCKED
+    assert diagnostic.omission_error_code is None
+    assert diagnostic.to_json()["collection_state"] == CollectionState.BLOCKED.value
+    assert diagnostic.to_json()["error_code"] is None
+    assert diagnostic.to_json()["remaining_control_code"] == "human_review_required"
+    assert diagnostic.to_json()["human_waiver_path"] == "not_consumed_by_routing"
+
+
+def test_supporting_critical_missing_or_unreadable_has_specific_reason_and_omission_details():
+    cases = (
+        (
+            ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
+            CollectionState.BLOCKED,
+            None,
+            RoutingReasonCode.CRITICAL_SOURCE_INACCESSIBLE,
+        ),
+        (
+            ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+            CollectionState.ARCHIVED,
+            "extraction_source_text_unreadable",
+            RoutingReasonCode.CRITICAL_SOURCE_UNREADABLE,
+        ),
+    )
+    for index, (omission_reason, state, error_code, expected_reason) in enumerate(cases):
+        url = f"https://supporting-critical-{index}.example/report"
+        omission = ProductionExtractionOmissionV1(
+            canonical_url=url,
+            tier=ProductionReferenceTier.SUPPORTING,
+            collection_state=state,
+            reason=omission_reason,
+            error_code=error_code,
+        )
+        extraction = _extraction(omitted_sources=(omission,))
+        diagnostic = RoutingCriticalSourceDiagnosticV1(
+            source_id=f"supporting-{index}",
+            source_url=url,
+            failure_code=error_code or omission_reason.value,
+            tier=ProductionReferenceTier.SUPPORTING.value,
+            criticality=ProductionSourceCriticality.CRITICAL,
+            criticality_reason=ProductionSourceCriticalityReason.COVERAGE_UNKNOWN.value,
+            policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+        )
+
+        decision = _inputs(
+            extraction,
+            _projection(extraction),
+            diagnostics=(diagnostic,),
+        )
+
+        assert decision.status is RoutingStatus.NEEDS_REVIEW
+        assert decision.reason_code is expected_reason
+        persisted = next(
+            item for item in decision.critical_source_diagnostics if item.source_url == url
+        )
+        assert persisted.omission_collection_state is state
+        assert persisted.omission_error_code == error_code
+        assert persisted.to_json()["collection_state"] == state.value
+        assert persisted.to_json()["error_code"] == error_code
+
+
+def test_supporting_secondary_missing_source_does_not_block_routing():
+    omission = ProductionExtractionOmissionV1(
+        canonical_url="https://secondary.example/missing",
+        tier=ProductionReferenceTier.SUPPORTING,
+        collection_state=CollectionState.BLOCKED,
+        reason=ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
+        error_code=None,
+    )
+    extraction = _extraction(omitted_sources=(omission,))
+    diagnostic = RoutingCriticalSourceDiagnosticV1(
+        source_id="secondary-id",
+        source_url=omission.canonical_url,
+        failure_code=omission.reason.value,
+        tier=ProductionReferenceTier.SUPPORTING.value,
+        criticality=ProductionSourceCriticality.SECONDARY,
+        criticality_reason=ProductionSourceCriticalityReason.REDUNDANT_CORROBORATION.value,
+        policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+    )
+
+    decision = _inputs(extraction, _projection(extraction), diagnostics=(diagnostic,))
+
+    assert decision.status is RoutingStatus.DECIDED
+    assert decision.publication_kind is PublicationKind.BRIEF
+    assert decision.reason_code is RoutingReasonCode.NO_SUBJECT_IOC
+    persisted = decision.critical_source_diagnostics[0]
+    assert persisted.to_json()["remaining_control_code"] == "no_routing_block"
+
+
+def test_historical_critical_source_missing_reason_still_deserializes():
+    assert RoutingReasonCode("critical_source_missing") is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert ROUTING_POLICY_VERSION == "subject-publication-routing-v3-routing-reasons-v1"
 
 
 def test_confirmed_subject_ioc_routes_article_despite_critical_source_omission():
@@ -435,7 +593,7 @@ def test_bridge_transcribed_core_source_keeps_ioc_contextual_and_needs_review():
 
     assert decision.status is RoutingStatus.NEEDS_REVIEW
     assert decision.publication_kind is None
-    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE
     assert decision.confirmed_ioc_count == 0
     assert decision.contextual_ioc_count == 1
     assert extraction.sources[0].indicators[0].evidence_basis is (
@@ -474,7 +632,7 @@ def test_bridge_core_source_blocks_article_promotion_from_another_confirmed_ioc(
     )
 
     assert decision.status is RoutingStatus.NEEDS_REVIEW
-    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE
     assert decision.publication_kind is None
     assert decision.confirmed_ioc_count == 2
 
@@ -508,7 +666,7 @@ def test_derived_core_sources_force_review_even_with_confirmed_indicator(method)
     )
 
     assert decision.status is RoutingStatus.NEEDS_REVIEW
-    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE
     assert decision.publication_kind is None
     assert decision.confirmed_ioc_count == 1
 
@@ -603,6 +761,46 @@ def test_decision_hash_and_id_are_deterministic_across_replays():
     assert replay.decided_at != first.decided_at
 
 
+def test_decision_hash_is_deterministic_across_source_order():
+    extraction = _extraction(facts=("first",))
+    other_source = _extraction(facts=("second",)).sources[0]
+    extraction = replace(extraction, sources=(*extraction.sources, other_source))
+    reordered = replace(extraction, sources=tuple(reversed(extraction.sources)))
+    extraction_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="e" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="f" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+
+    first = _inputs(
+        extraction,
+        _projection(extraction),
+        extraction_artifact=extraction_artifact,
+        projection_artifact=projection_artifact,
+    )
+    replay = _inputs(
+        reordered,
+        _projection(reordered),
+        extraction_artifact=extraction_artifact,
+        projection_artifact=projection_artifact,
+    )
+
+    assert replay.input_hash == first.input_hash
+    assert replay.decision_hash == first.decision_hash
+    assert replay.decision_id == first.decision_id
+
+
 def test_requalification_brief_article_brief_keeps_distinct_history_inputs():
     brief_extraction = _extraction(facts=("one",))
     brief_one = _inputs(brief_extraction, _projection(brief_extraction))
@@ -675,7 +873,7 @@ def test_secondary_critical_source_diagnostic_blocks_routing():
     )
     decision = _inputs(extraction, projection, diagnostics=(diagnostic,))
     assert decision.status is RoutingStatus.NEEDS_REVIEW
-    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_UNREADABLE
 
 
 def test_diagnostic_order_does_not_change_canonical_input_or_decision_hash():
