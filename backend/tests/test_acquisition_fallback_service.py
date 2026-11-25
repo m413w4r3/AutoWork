@@ -35,6 +35,7 @@ from cti_app.application.http_collection import (
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import JobRegistry, JobService
 from cti_app.domain.acquisition import (
+    AcquisitionCapabilityState,
     AcquisitionObservationKind,
     AcquisitionOutcome,
     AcquisitionPolicyContext,
@@ -244,6 +245,32 @@ class FailedProbeStrategy:
                 duration_ms=4,
             ),
         )
+
+
+class BlockingFailedProbeStrategy(FailedProbeStrategy):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def acquire(self, request) -> Sequence[AcquisitionProbe]:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return await super().acquire(request)
+
+
+class MutableCapabilityFailureStrategy(FailedProbeStrategy):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.capability_state = AcquisitionCapabilityState.DISABLED_BY_CONFIGURATION
+        self.capability_outcome = AcquisitionOutcome.NOT_CONFIGURED
+        self.capability_reason = "synthetic_not_configured"
+        self.capability_policy_decision = AcquisitionPolicyDecision.NOT_CONFIGURED
+
+    async def acquire(self, request) -> Sequence[AcquisitionProbe]:
+        self.calls += 1
+        return await super().acquire(request)
 
 
 class PolicyCaptureStrategy(NoopStrategy):
@@ -588,6 +615,128 @@ async def test_service_fallback_runs_share_per_host_limiter(tmp_path):
     assert states == [CollectionState.ARCHIVED, CollectionState.ARCHIVED]
     assert len(transport.requests) == 2
     assert transport.maximum_active == 1
+
+
+@pytest.mark.asyncio
+async def test_two_fallback_callers_share_the_collection_lease(tmp_path):
+    strategy = BlockingFailedProbeStrategy()
+    factory, service, _subject, source, _blob_store = await _service(
+        tmp_path, transport=Transport(), strategies=(strategy,)
+    )
+
+    first = asyncio.create_task(
+        service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
+    )
+    await strategy.started.wait()
+    second_state = await service._acquire_fallback_chain(
+        source.id, uuid4(), None, explicit_request=True
+    )
+    strategy.release.set()
+
+    assert second_state is CollectionState.FETCHING
+    assert await first is CollectionState.BLOCKED
+    assert strategy.calls == 1
+    assert (
+        sum(
+            event.event_type == "source.acquisition_fallback_chain_completed"
+            for event in factory.provenance
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_completion_marker_rechecks_capability_and_legacy_payload(tmp_path):
+    strategy = MutableCapabilityFailureStrategy()
+    factory, service, _subject, source, _blob_store = await _service(
+        tmp_path, transport=Transport(), strategies=(strategy,)
+    )
+    source.failure_reason_code = CollectionFailureReason.HTTP_ERROR
+    source.error_reason = "synthetic direct HTTP failure"
+
+    assert (
+        await service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
+        is CollectionState.BLOCKED
+    )
+    markers = [
+        event
+        for event in factory.provenance
+        if event.event_type == "source.acquisition_fallback_chain_completed"
+    ]
+    assert len(markers) == 1
+    assert len(markers[0].payload["effective_context_sha256"]) == 64
+
+    # A marker written by the old format has no context digest and must fail closed.
+    markers[0].payload.pop("effective_context_sha256")
+    assert (
+        await service._acquire_fallback_chain(source.id, uuid4(), None) is CollectionState.BLOCKED
+    )
+    assert (
+        sum(
+            event.event_type == "source.acquisition_fallback_chain_completed"
+            for event in factory.provenance
+        )
+        == 2
+    )
+
+    strategy.capability_state = AcquisitionCapabilityState.IMPLEMENTED
+    strategy.capability_policy_decision = AcquisitionPolicyDecision.ALLOWED
+    assert (
+        await service._acquire_fallback_chain(source.id, uuid4(), None) is CollectionState.BLOCKED
+    )
+    assert strategy.calls == 1
+    assert (
+        sum(
+            event.event_type == "source.acquisition_fallback_chain_completed"
+            for event in factory.provenance
+        )
+        == 3
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_completion_marker_hashes_provider_credentials(tmp_path):
+    factory, service, _subject, source, blob_store = await _service(
+        tmp_path,
+        transport=Transport(),
+        strategies=(FailedProbeStrategy(),),
+        third_party_provider_enabled=True,
+        third_party_provider_url="https://provider.example/extract",
+        third_party_provider_token="synthetic-first-token",
+    )
+    source.failure_reason_code = CollectionFailureReason.HTTP_ERROR
+    source.error_reason = "synthetic direct HTTP failure"
+
+    await service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
+    first_marker = next(
+        event
+        for event in factory.provenance
+        if event.event_type == "source.acquisition_fallback_chain_completed"
+    )
+    assert "synthetic-first-token" not in repr(first_marker.payload)
+
+    updated_service = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(Transport(), Resolver(), CollectionPolicy()),
+        blob_store,
+        fallback_strategies=(FailedProbeStrategy(),),
+        third_party_provider_enabled=True,
+        third_party_provider_url="https://provider.example/extract",
+        third_party_provider_token="synthetic-second-token",
+    )
+    await updated_service._acquire_fallback_chain(source.id, uuid4(), None)
+
+    markers = [
+        event
+        for event in factory.provenance
+        if event.event_type == "source.acquisition_fallback_chain_completed"
+    ]
+    assert len(markers) == 2
+    assert all(
+        token not in repr(event.payload)
+        for token in ("synthetic-first-token", "synthetic-second-token")
+        for event in markers
+    )
 
 
 @pytest.mark.asyncio
