@@ -130,4 +130,26 @@ describe("ExtractionProgressView", () => {
       screen.getByText("Résultats existants : 1 · Appels modèle : 0"),
     ).toBeInTheDocument();
   });
+
+  it("masque les secrets des URL source et neutralise les schémas non HTTP", () => {
+    render(
+      <ExtractionProgressView
+        progress={progress([
+          source(
+            "https://analyst:password@source.example/report?token=secret&uri=CELEX%3A42#fragment",
+          ),
+          source("javascript:alert(1)", { source_id: "unsafe" }),
+        ])}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        "https://source.example/report?token=REDACTED&uri=CELEX%3A42",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("URL non affichable")).toBeInTheDocument();
+    expect(screen.queryByText(/analyst|password|secret|fragment/)).toBeNull();
+    expect(screen.queryByRole("link")).toBeNull();
+  });
 });

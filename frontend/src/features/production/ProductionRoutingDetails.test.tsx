@@ -189,12 +189,12 @@ describe("ProductionRoutingDetails", () => {
     [
       "provenance_mismatch",
       /lignée.*artefact.*ne correspond pas.*instantané/i,
-      /relancez l’étape ou inspectez les artefacts.*rien n’a été publié/i,
+      /dans l’onglet Pipeline.*relancez Extraction puis Périmètre des preuves.*rien n’a été publié/i,
     ],
     [
       "incomplete_extraction",
       /source d’extraction.*omise ou.*échoué/i,
-      /réextrayez ou réparez la source/i,
+      /relancez l’étape Extraction dans l’onglet Pipeline.*rien n’a été publié/i,
     ],
   ])("explique la cause et l’action pour %s", (reasonCode, cause, action) => {
     render(
@@ -399,5 +399,73 @@ describe("ProductionRoutingDetails", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByText(/continuer sans source/i)).toBeNull();
+  });
+
+  it("n’affiche pas comme lien une URL de source avec un schéma dangereux", () => {
+    const { container } = render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "critical_source_inaccessible",
+          sources: [routingSource({ source_url: "javascript:alert(1)" })],
+        })}
+      />,
+    );
+
+    expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
+    expect(container).toHaveTextContent("URL non affichable");
+  });
+
+  it.each([
+    ["missing_extraction_artifact", "Extraction", "manquant"],
+    ["invalid_extraction_artifact", "Extraction", "invalide ou obsolète"],
+    ["missing_relevance_artifact", "Périmètre des preuves", "manquant"],
+    [
+      "invalid_relevance_artifact",
+      "Périmètre des preuves",
+      "invalide ou obsolète",
+    ],
+    ["incomplete_projection", "Périmètre des preuves", "incomplet"],
+  ] as const)(
+    "explique %s et nomme l’étape du Pipeline à relancer",
+    (reasonCode, stage, cause) => {
+      render(
+        <ProductionRoutingDetails
+          routing={routing({
+            status: "needs_review",
+            publication_kind: null,
+            reason_code: reasonCode,
+          })}
+        />,
+      );
+
+      expect(screen.getByRole("status")).toHaveTextContent(
+        new RegExp(`artefact.*étape ${stage}.*${cause}`, "i"),
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        new RegExp(`Relancez l’étape ${stage} dans l’onglet Pipeline`),
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "rien n’a été publié",
+      );
+    },
+  );
+
+  it("nomme l’onglet Pipeline et l’étape Sources dans les actions de source", () => {
+    render(
+      <ProductionRoutingDetails
+        routing={routing({
+          status: "needs_review",
+          publication_kind: null,
+          reason_code: "critical_source_inaccessible",
+          sources: [routingSource()],
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /onglet Pipeline, étape Sources/i,
+    );
   });
 });

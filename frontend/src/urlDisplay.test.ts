@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { sanitizeUrlForDisplay } from "./urlDisplay";
+import {
+  safeHttpHref,
+  sanitizeTextForDisplay,
+  sanitizeUrlForDisplay,
+} from "./urlDisplay";
 
 describe("sanitizeUrlForDisplay", () => {
   it("retains identifying parameters while stripping userinfo and fragments", () => {
@@ -41,5 +45,67 @@ describe("sanitizeUrlForDisplay", () => {
     expect(sanitizeUrlForDisplay("Diagnostic #2 retained")).toBe(
       "Diagnostic #2 retained",
     );
+  });
+
+  it.each([
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "vbscript:msgbox(1)",
+    "file:///tmp/report",
+    "JaVaScRiPt:alert(1)",
+    "java\tscript:alert(1)",
+  ])("replaces non-HTTP URL schemes with a neutral label", (value) => {
+    expect(sanitizeUrlForDisplay(value)).toBe("URL non affichable");
+  });
+});
+
+describe("safeHttpHref", () => {
+  it.each([
+    "javascript:alert(1)",
+    "data:text/html,<script>alert(1)</script>",
+    "vbscript:msgbox(1)",
+    "file:///tmp/report",
+    "JaVaScRiPt:alert(1)",
+    "java\tscript:alert(1)",
+    "//source.example/report",
+    "/subjects/123",
+    "source.example/report",
+  ])("rejects unsafe or non-absolute URL inputs", (value) => {
+    expect(safeHttpHref(value)).toBeNull();
+  });
+
+  it.each(["http", "https"] as const)(
+    "keeps a sanitized %s URL for display",
+    (protocol) => {
+      const href = safeHttpHref(
+        `${protocol}://analyst:password@source.example/report?uri=CELEX%3A42&token=secret&X-Amz-Signature=signed#section`,
+      );
+
+      expect(href).not.toBeNull();
+      const safe = new URL(href ?? "");
+      expect(safe.protocol).toBe(`${protocol}:`);
+      expect(safe.username).toBe("");
+      expect(safe.password).toBe("");
+      expect(safe.hash).toBe("");
+      expect(safe.searchParams.get("uri")).toBe("CELEX:42");
+      expect(safe.searchParams.get("token")).toBe("REDACTED");
+      expect(safe.searchParams.get("X-Amz-Signature")).toBe("REDACTED");
+      expect(href).not.toContain("password");
+      expect(href).not.toContain("signed");
+    },
+  );
+});
+
+describe("sanitizeTextForDisplay", () => {
+  it("redacts URLs embedded in free text and bounds the result", () => {
+    const text = sanitizeTextForDisplay(
+      "Request failed for https://analyst:password@source.example/report?token=secret&ref=ok#fragment",
+    );
+
+    expect(text).toContain(
+      "https://source.example/report?token=REDACTED&ref=ok",
+    );
+    expect(text).not.toMatch(/analyst|password|secret|fragment/);
+    expect(sanitizeTextForDisplay("x".repeat(600))).toHaveLength(500);
   });
 });

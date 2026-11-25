@@ -32,7 +32,11 @@ import {
 } from "../features/production/productionLabels";
 import { RETRYABLE_PRODUCTION_STAGES } from "../features/production/productionStages";
 import { Link } from "../routing";
-import { sanitizeUrlForDisplay } from "../urlDisplay";
+import {
+  safeHttpHref,
+  sanitizeTextForDisplay,
+  sanitizeUrlForDisplay,
+} from "../urlDisplay";
 
 interface SubjectProductionProps {
   subjectId: string;
@@ -68,17 +72,6 @@ const RETRY_DESCRIPTIONS: Record<RetryStage, string> = {
   assembly:
     "L’assemblage sera recalculé. Les références existantes seront conservées.",
 };
-
-const CONVERSATION_ERROR_CODES = new Set([
-  "bridge_server_error",
-  "bridge_timeout",
-  "bridge_ui_timeout",
-  "bridge_idle_timeout",
-  "bridge_total_timeout",
-  "conversation_unavailable",
-  "conversation_profile_mismatch",
-  "conversation_busy",
-]);
 
 const RETRY_BLOCKED_ERROR_CODES = new Set([
   "publication_routing_needs_review",
@@ -121,7 +114,7 @@ function safeDiagnosticValue(
     return "[masqué]";
   }
   if (typeof value === "string") {
-    return sanitizeUrlForDisplay(value).slice(0, 1_000);
+    return sanitizeTextForDisplay(value);
   }
   if (
     typeof value === "number" ||
@@ -221,9 +214,6 @@ function issueCopy(
   if (errorCode === "editorial_enrichment_empty_after_rejections") {
     return "Toutes les tables, tous les diagrammes et toutes les figures proposés ont été rejetés. Vérifiez l’enrichissement éditorial avant de poursuivre.";
   }
-  if (errorCode && CONVERSATION_ERROR_CODES.has(errorCode)) {
-    return "Intervention requise — la soumission du modèle doit être réconciliée avant de poursuivre.";
-  }
   return status === "needs_review"
     ? "Intervention requise — vérifiez cette étape avant de poursuivre."
     : "Échec de l’étape — consultez ses détails.";
@@ -313,7 +303,8 @@ export function SubjectProduction({
   if (error)
     return (
       <p className="error-message" role="alert">
-        L’état de production est inaccessible : {String(error)}
+        L’état de production est inaccessible :{" "}
+        {sanitizeTextForDisplay(String(error))}
       </p>
     );
 
@@ -361,15 +352,17 @@ export function SubjectProduction({
         ) : null}
         {startMutation.error ? (
           <p className="error-message" role="alert">
-            {productionErrorMessage(
-              startMutation.error,
-              "La production n’a pas pu être démarrée.",
+            {sanitizeTextForDisplay(
+              productionErrorMessage(
+                startMutation.error,
+                "La production n’a pas pu être démarrée.",
+              ),
             )}
           </p>
         ) : null}
         {resumeMutation.error ? (
           <p className="error-message" role="alert">
-            {String(resumeMutation.error)}
+            {sanitizeTextForDisplay(String(resumeMutation.error))}
           </p>
         ) : null}
         {resumePlan ? (
@@ -442,7 +435,7 @@ export function SubjectProduction({
     .map((warning) => ({
       ...warning,
       url: warning.url ? sanitizeUrlForDisplay(warning.url) : null,
-      message: sanitizeUrlForDisplay(warning.message),
+      message: sanitizeTextForDisplay(warning.message),
     }))
     .concat(
       skippedSources.map((source) => ({
@@ -580,31 +573,41 @@ export function SubjectProduction({
             <summary>Détail diagnostic</summary>
             {blockingSources.length > 0 ? (
               <ul aria-label="Sources responsables">
-                {blockingSources.map((source) => (
-                  <li key={source.sourceId}>
-                    {source.title ? <strong>{source.title}</strong> : null}
-                    {source.url ? (
-                      <>
-                        {source.title ? <br /> : null}
-                        <a href={sanitizeUrlForDisplay(source.url)}>
-                          {sanitizeUrlForDisplay(source.url)}
-                        </a>
-                      </>
-                    ) : (
-                      <strong>{source.sourceId}</strong>
-                    )}
-                    {source.errorCode ? (
-                      <>
-                        <br />
-                        <code>{source.errorCode}</code>
-                      </>
-                    ) : null}
-                  </li>
-                ))}
+                {blockingSources.map((source) => {
+                  const displayUrl = source.url
+                    ? sanitizeUrlForDisplay(source.url)
+                    : null;
+                  const href = source.url ? safeHttpHref(source.url) : null;
+                  return (
+                    <li key={source.sourceId}>
+                      {source.title ? <strong>{source.title}</strong> : null}
+                      {displayUrl ? (
+                        <>
+                          {source.title ? <br /> : null}
+                          {href ? (
+                            <a href={href}>{displayUrl}</a>
+                          ) : (
+                            <span>{displayUrl}</span>
+                          )}
+                        </>
+                      ) : (
+                        <strong>{source.sourceId}</strong>
+                      )}
+                      {source.errorCode ? (
+                        <>
+                          <br />
+                          <code>{source.errorCode}</code>
+                        </>
+                      ) : null}
+                    </li>
+                  );
+                })}
               </ul>
             ) : null}
             <p>Code : {issueCode ?? "inconnu"}</p>
-            {issueMessage ? <p>{sanitizeUrlForDisplay(issueMessage)}</p> : null}
+            {issueMessage ? (
+              <p>{sanitizeTextForDisplay(issueMessage)}</p>
+            ) : null}
           </details>
           <a href={stageArtifactHref(subjectId, status.current_stage)}>
             Voir les détails de l’étape
@@ -661,7 +664,8 @@ export function SubjectProduction({
 
       {retryStageMutation.error ? (
         <p className="error-message" role="alert">
-          La relance n’a pas pu démarrer : {String(retryStageMutation.error)}
+          La relance n’a pas pu démarrer :{" "}
+          {sanitizeTextForDisplay(String(retryStageMutation.error))}
         </p>
       ) : null}
 
@@ -743,23 +747,26 @@ export function SubjectProduction({
         >
           <h3 id="production-warnings-heading">Avertissements non bloquants</h3>
           <ul>
-            {presentedWarnings.map((warning, index) => (
-              <li key={`${warning.code}-${warning.source ?? ""}-${index}`}>
-                <strong>{warning.title}</strong>
-                {warning.source ? (
-                  <>
-                    <br />
-                    {warning.url ? (
-                      <a href={warning.url}>{warning.source}</a>
-                    ) : (
-                      <span>{warning.source}</span>
-                    )}
-                  </>
-                ) : null}
-                <br />
-                <span>{warning.message}</span>
-              </li>
-            ))}
+            {presentedWarnings.map((warning, index) => {
+              const href = warning.url ? safeHttpHref(warning.url) : null;
+              return (
+                <li key={`${warning.code}-${warning.source ?? ""}-${index}`}>
+                  <strong>{warning.title}</strong>
+                  {warning.source ? (
+                    <>
+                      <br />
+                      {href ? (
+                        <a href={href}>{warning.source}</a>
+                      ) : (
+                        <span>{warning.source}</span>
+                      )}
+                    </>
+                  ) : null}
+                  <br />
+                  <span>{warning.message}</span>
+                </li>
+              );
+            })}
           </ul>
         </section>
       )}
