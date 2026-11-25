@@ -949,6 +949,26 @@ class PlaywrightStrategy:
         status = request.response_status
         headers = dict(request.response_headers or {})
         started = time.monotonic()
+
+        def blocked_response_probe() -> tuple[AcquisitionProbe, ...]:
+            return (
+                AcquisitionProbe(
+                    strategy_name=self.name,
+                    strategy_version=self.version,
+                    method=self.method,
+                    requested_url=request.requested_url,
+                    outcome=_typed_probe_outcome("rejected"),
+                    reason_code="blocked_http_response_not_renderable",
+                    response=None,
+                    http_status=status,
+                    encoded_size=len(body) if body else None,
+                    encoded_sha256=hashlib.sha256(body).hexdigest() if body else None,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                ),
+            )
+
+        if status in {401, 403}:
+            return blocked_response_probe()
         if not body:
             try:
                 response = await request.fetch(
@@ -961,6 +981,8 @@ class PlaywrightStrategy:
                 body = error.response_body
                 status = error.http_status
                 headers = error.headers
+        if status in {401, 403}:
+            return blocked_response_probe()
         if not body:
             return (
                 AcquisitionProbe(
@@ -2077,6 +2099,15 @@ class _BrowserStrategy:
         return AcquisitionPolicyDecision.NOT_CONFIGURED
 
     async def acquire(self, request: AcquisitionRequest) -> Sequence[AcquisitionProbe]:
+        if request.response_status in {401, 403}:
+            return (
+                _browser_failure_probe(
+                    self,
+                    request,
+                    reason="blocked_http_response_not_renderable",
+                    outcome=AcquisitionOutcome.REJECTED,
+                ),
+            )
         capability = self.capability_state
         if capability is not AcquisitionCapabilityState.IMPLEMENTED:
             return (

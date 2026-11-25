@@ -133,6 +133,7 @@ def _request(
     title: str = _TITLE,
     response_body: bytes | None = None,
     content_type: str | None = None,
+    response_status: int | None = None,
     captured_json: tuple[CapturedJson, ...] = (),
 ) -> AcquisitionRequest:
     policy = AcquisitionPolicyContext(
@@ -151,7 +152,9 @@ def _request(
         title=title,
         published_at=None,
         response_body=response_body,
-        response_status=403 if response_body else None,
+        response_status=(
+            response_status if response_status is not None else 403 if response_body else None
+        ),
         response_content_type=content_type,
         response_headers={"content-type": content_type} if content_type else {},
         link_header=None,
@@ -297,7 +300,7 @@ async def test_case_03_javascript_only_page_uses_fake_secure_browser_dom(tmp_pat
     )
     factory, app, source, _transport = await _service(
         tmp_path,
-        responses=[_BLOCKED],
+        responses=[RawHttpResponse(404, {"content-type": "text/html"}, b"not found")],
         strategies=(BrowserDomStrategy(navigator, navigation_enabled=True),),
     )
     state = await app.archive_one(source.id, uuid4())
@@ -330,7 +333,12 @@ async def test_case_04_empty_dom_uses_captured_public_json():
         pytest.fail("browser network capture is supplied by the offline adapter")
 
     probes = await BrowserNetworkStrategy(navigator, navigation_enabled=True).acquire(
-        _request(no_fetch, response_body=b"<html>empty</html>", content_type="text/html")
+        _request(
+            no_fetch,
+            response_body=b"<html>empty</html>",
+            content_type="text/html",
+            response_status=200,
+        )
     )
     winner = next(probe for probe in probes if probe.outcome is AcquisitionOutcome.SUCCEEDED)
     assert winner.response is not None
@@ -462,7 +470,7 @@ async def test_case_09_independent_copy_remains_unverified_as_primary(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_case_10_pdf_and_image_ocr_archive_derived_text_with_provenance(tmp_path):
+async def test_case_10_pdf_fallback_and_403_image_is_not_ocr_archived(tmp_path):
     from tests.test_acquisition_integration import ARTICLE_TITLE
     from tests.test_article_extraction import PDF_FIXTURE
 
@@ -472,18 +480,32 @@ async def test_case_10_pdf_and_image_ocr_archive_derived_text_with_provenance(tm
             return f"{_TITLE}\n{_ARTICLE_TEXT}"
 
     image = b"\x89PNG\r\n\x1a\nfixture image bytes"
+
+    async def no_fetch(*_args):
+        pytest.fail("OCR uses the supplied image artifact")
+
+    ocr_probes = await _VisualOcrAdapter(engine=FakeOcr()).acquire(
+        _request(
+            no_fetch,
+            response_body=image,
+            content_type="image/png",
+            response_status=200,
+        )
+    )
+    assert ocr_probes[0].outcome is AcquisitionOutcome.SUCCEEDED
+    assert ocr_probes[0].response is not None
+    assert ocr_probes[0].response.decoded_body
+
     ocr_factory, ocr_app, ocr_source, _ = await _service(
         tmp_path / "ocr",
         responses=[RawHttpResponse(403, {"content-type": "image/png"}, image)],
         strategies=(_VisualOcrAdapter(engine=FakeOcr()),),
     )
-    assert await ocr_app.archive_one(ocr_source.id, uuid4()) is CollectionState.ARCHIVED
-    ocr_receipt = await ocr_app.archive_receipt(ocr_factory.collections[ocr_source.id])
-    assert ocr_receipt is not None
-    assert ocr_receipt.acquisition_method is SourceAcquisitionMethod.VISUAL_OCR
-    assert ocr_receipt.observation_kind is AcquisitionObservationKind.OCR_TEXT
-    assert ocr_receipt.evidence_class is EvidenceClass.OCR_DERIVED
-    assert ocr_receipt.encoded_sha256 == hashlib.sha256(image).hexdigest()
+    assert await ocr_app.archive_one(ocr_source.id, uuid4()) is CollectionState.BLOCKED
+    assert ocr_factory.collections[ocr_source.id].source_document_id is None
+    assert not any(
+        event.event_type == "source.archived_fallback" for event in ocr_factory.provenance
+    )
 
     pdf_url = "https://source.example/files/report.pdf"
     page = f'<html><body><a href="{pdf_url}">Download PDF</a></body></html>'.encode()
@@ -747,10 +769,10 @@ async def test_case_22_browser_egress_failure_fails_closed(tmp_path):
     navigator = _Navigator(fail=True)
     factory, app, source, _transport = await _service(
         tmp_path,
-        responses=[_BLOCKED],
+        responses=[RawHttpResponse(404, {"content-type": "text/html"}, b"not found")],
         strategies=(BrowserDomStrategy(navigator, navigation_enabled=True),),
     )
-    assert await app.archive_one(source.id, uuid4()) is CollectionState.BLOCKED
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.UNAVAILABLE
     assert navigator.calls == [_URL]
     failed = next(
         event

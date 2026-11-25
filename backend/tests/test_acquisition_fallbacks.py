@@ -39,9 +39,11 @@ from cti_app.application.http_collection import (
     CollectionError,
     CollectionPolicy,
     DownloadTransientError,
+    PinnedHttpRequest,
     RawHttpResponse,
     SafeHttpCollector,
 )
+from cti_app.application.jobs import JobHandlerError
 from cti_app.application.production_extraction import (
     PlannedExtractionSource,
     build_canonical_source_extraction,
@@ -111,6 +113,10 @@ _BLOCKED_WITH_AMP = (
     b'<link rel="amphtml" href="/amp/"></head><body>Access denied</body></html>'
 )
 _BLOCKED = RawHttpResponse(403, {"content-type": "text/html"}, _BLOCKED_WITH_AMP)
+_JS_SHELL = (
+    b"<!doctype html><html><head><title>Loading report</title></head>"
+    b"<body><div id=app>Loading publication</div></body></html>"
+)
 
 
 def _collected(url: str, body: bytes, *, content_type: str = "text/html") -> CollectedResponse:
@@ -373,14 +379,10 @@ async def test_unparseable_bridge_output_stays_blocked_and_replay_is_not_resubmi
         for event in factory.provenance
         if event.event_type == "source.acquisition_fallback_attempted"
     ]
-    assert [event.payload["outcome"] for event in events] == [
-        "rejected",
-        "skipped",
-    ]
+    assert [event.payload["outcome"] for event in events] == ["rejected"]
     assert events[0].payload["response_sha256"]
     attempts = await app.attempts(source.id)
-    assert attempts[-2].reason_code.value == "bridge_transcription_failed"
-    assert attempts[-1].outcome.value == "skipped"
+    assert attempts[-1].reason_code.value == "bridge_transcription_failed"
     assert attempts[-1].strategy_name == "bridge_transcription"
     async with factory() as uow:
         reference_observation = await observe_reference_collections(
@@ -389,10 +391,7 @@ async def test_unparseable_bridge_output_stays_blocked_and_replay_is_not_resubmi
     assert reference_observation[source.canonical_url].source_document_id is None
     assert [
         item["outcome"] for item in reference_observation[source.canonical_url].acquisition_attempts
-    ] == [
-        "rejected",
-        "skipped",
-    ]
+    ] == ["rejected"]
 
 
 @pytest.mark.asyncio
@@ -475,19 +474,113 @@ async def test_retry_after_is_honored_with_a_bounded_fake_delay():
 async def test_playwright_strategy_uses_fake_sidecar_and_archives_rendered_dom():
     adapter = FakeBrowserAdapter(_ARTICLE.decode("utf-8"))
     request = _request(lambda *args: None)
-    request.response_body = _BLOCKED_WITH_AMP
-    request.response_status = 403
+    request.response_body = _JS_SHELL
+    request.response_status = 200
     request.response_content_type = "text/html"
 
     probes = await PlaywrightStrategy(adapter=adapter).acquire(request)
 
     assert probes[0].outcome == "succeeded"
     assert probes[0].method is SourceAcquisitionMethod.PLAYWRIGHT_RENDERED
-    assert probes[0].http_status == 403
+    assert probes[0].http_status == 200
     assert probes[0].encoded_sha256 == hashlib.sha256(_ARTICLE).hexdigest()
     assert probes[0].response is not None
     assert probes[0].response.decoded_body == _ARTICLE
-    assert adapter.calls == [("https://source.example/", _BLOCKED_WITH_AMP.decode("utf-8"), 45.0)]
+    assert adapter.calls == [("https://source.example/", _JS_SHELL.decode("utf-8"), 45.0)]
+
+
+@pytest.mark.asyncio
+async def test_playwright_cannot_archive_an_article_body_received_with_403(tmp_path):
+    adapter = FakeBrowserAdapter(_ARTICLE.decode("utf-8"))
+    transport = Transport([RawHttpResponse(403, {"content-type": "text/html"}, _ARTICLE)])
+    factory, app, source, _gateway = await _service(
+        tmp_path,
+        transport=transport,
+        strategies=(PlaywrightStrategy(adapter=adapter),),
+    )
+
+    result = await app.archive_one(source.id, uuid4())
+
+    assert result is CollectionState.BLOCKED
+    assert factory.collections[source.id].source_document_id is None
+    assert not any(event.event_type == "source.archived_fallback" for event in factory.provenance)
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_completed_fallback_chain_is_not_replayed_until_config_changes_or_manual_request(
+    tmp_path,
+):
+    adapter = FakeBrowserAdapter(_ARTICLE.decode("utf-8"))
+    strategy = PlaywrightStrategy(adapter=adapter)
+    transport = Transport([_BLOCKED])
+    factory, app, source, _gateway = await _service(
+        tmp_path,
+        transport=transport,
+        strategies=(strategy,),
+    )
+
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.BLOCKED
+    attempts_after_first_chain = len(await app.attempts(source.id))
+    assert attempts_after_first_chain == 2
+    blocked_snapshot = (
+        factory.collections[source.id].state,
+        factory.collections[source.id].failure_reason_code,
+        factory.collections[source.id].error_reason,
+        factory.collections[source.id].latest_attempt_id,
+    )
+
+    async def run_q1_pass(service: SubjectCollectionService) -> None:
+        job_id = uuid4()
+        with pytest.raises(JobHandlerError):
+            await service.collect_subject(
+                source.subject_id,
+                job_id,
+                NoopContext(job_id),
+                collection_id=source.id,
+            )
+
+    await run_q1_pass(app)
+    assert len(await app.attempts(source.id)) == attempts_after_first_chain
+    assert len(transport.requests) == 1
+    assert (
+        factory.collections[source.id].state,
+        factory.collections[source.id].failure_reason_code,
+        factory.collections[source.id].error_reason,
+        factory.collections[source.id].latest_attempt_id,
+    ) == blocked_snapshot
+
+    version_two = replace(strategy, version="2")
+    app._fallback_strategies = (version_two,)
+    await run_q1_pass(app)
+    assert len(await app.attempts(source.id)) == attempts_after_first_chain + 1
+
+    policy_changed_app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(transport, Resolver(), CollectionPolicy(timeout_seconds=30)),
+        FilesystemBlobStore(tmp_path / "changed-policy-blobs"),
+        fallback_strategies=(version_two,),
+    )
+    await policy_changed_app.initialize(source.subject_id)
+    attempts_after_version_change = len(await app.attempts(source.id))
+    await run_q1_pass(policy_changed_app)
+    assert len(await app.attempts(source.id)) == attempts_after_version_change + 1
+
+    await run_q1_pass(policy_changed_app)
+    assert len(await app.attempts(source.id)) == attempts_after_version_change + 1
+
+    explicit_job_id = uuid4()
+    assert (
+        await policy_changed_app.fallback_acquire(
+            source.subject_id,
+            source.id,
+            explicit_job_id,
+            NoopContext(explicit_job_id),
+        )
+        is CollectionState.BLOCKED
+    )
+    assert len(await app.attempts(source.id)) == attempts_after_version_change + 2
+    assert adapter.calls == []
 
 
 @pytest.mark.asyncio
@@ -506,13 +599,36 @@ async def test_playwright_sidecar_unavailable_is_a_recordable_skip():
 @pytest.mark.asyncio
 async def test_playwright_rendered_dom_archives_with_distinct_provenance(tmp_path):
     adapter = FakeBrowserAdapter(_ARTICLE.decode("utf-8"))
+
+    class TimeoutThenJavaScriptPageTransport(Transport):
+        def __init__(self) -> None:
+            super().__init__([])
+
+        async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise DownloadTransientError(
+                    "offline fake timeout",
+                    reason_code=CollectionFailureReason.TIMEOUT,
+                    transport_classification=CollectionTransportClassification.TIMEOUT,
+                )
+            return RawHttpResponse(200, {"content-type": "text/html"}, _JS_SHELL)
+
+    transport = TimeoutThenJavaScriptPageTransport()
     factory, app, source, _gateway = await _service(
         tmp_path,
-        transport=Transport([_BLOCKED]),
+        transport=transport,
         strategies=(PlaywrightStrategy(adapter=adapter),),
     )
 
-    result = await app.archive_one(source.id, uuid4())
+    assert await app.archive_one(source.id, uuid4()) is CollectionState.FAILED_RETRYABLE
+    job_id = uuid4()
+    result = await app.fallback_acquire(
+        source.subject_id,
+        source.id,
+        job_id,
+        NoopContext(job_id),
+    )
 
     assert result is CollectionState.ARCHIVED
     receipt = await app.archive_receipt(factory.collections[source.id])
@@ -525,6 +641,8 @@ async def test_playwright_rendered_dom_archives_with_distinct_provenance(tmp_pat
     )
     assert archived.payload["acquisition_method"] == "playwright_rendered"
     assert archived.payload["verification_status"] == "archived_http_content"
+    assert len(adapter.calls) == 1
+    assert adapter.calls[0][1:] == (_JS_SHELL.decode("utf-8"), 45.0)
 
 
 def test_playwright_registry_requires_a_configured_adapter():

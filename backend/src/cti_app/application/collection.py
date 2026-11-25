@@ -33,6 +33,7 @@ from cti_app.application.acquisition_fallbacks import (
     safe_fallback_url,
 )
 from cti_app.application.acquisition_orchestrator import (
+    AcquisitionRunResult,
     ArticleAcquisitionOrchestrator,
     DomainConcurrencyLimiter,
 )
@@ -110,6 +111,7 @@ from cti_app.logging import get_correlation_id
 _FALLBACK_MODEL_RUN_NAMESPACE = UUID("79af24d6-1b5b-42b8-b21d-5116e2c3b2f5")
 
 logger = logging.getLogger(__name__)
+_MAX_TRANSIENT_FETCH_ATTEMPTS = 3
 _COLLECTED_STATES = {
     CollectionState.ARCHIVED,
     CollectionState.EXTRACTED,
@@ -960,6 +962,35 @@ class SubjectCollectionService:
                 raise CollectionItemNotFoundError(str(collection_id))
             attempts = await uow.collection_attempts.list_for_collection(collection_id)
             previous_policy = attempts[-1].policy_snapshot_id if attempts else None
+            reason_code = collection.failure_reason_code
+            if reason_code in {
+                CollectionFailureReason.DNS_ERROR,
+                CollectionFailureReason.TIMEOUT,
+            }:
+                direct_transient_attempts = sum(
+                    attempt.strategy_name is None
+                    and attempt.reason_code
+                    in {
+                        CollectionFailureReason.DNS_ERROR,
+                        CollectionFailureReason.TIMEOUT,
+                    }
+                    for attempt in attempts
+                )
+                if direct_transient_attempts >= _MAX_TRANSIENT_FETCH_ATTEMPTS:
+                    collection.state = CollectionState.FAILED_TERMINAL
+                    collection.updated_at = datetime.now(UTC)
+                    await uow.source_collections.save(collection)
+                    await uow.commit()
+                    logger.warning(
+                        "collection_transient_retries_exhausted",
+                        extra={
+                            "event": "source.collection.retry_exhausted",
+                            "source_collection_id": str(collection.id),
+                            "attempt_count": direct_transient_attempts,
+                            "reason_code": reason_code.value,
+                        },
+                    )
+                    return collection
             collection.prepare_explicit_retry(
                 policy_changed=previous_policy is not None
                 and previous_policy != self._policy_snapshot.id
@@ -2146,6 +2177,13 @@ class SubjectCollectionService:
             return collection.state
         if subject is None or not self._fallback_acquisition_enabled:
             return collection.state
+        if not explicit_request and _completed_fallback_chain_matches(
+            events,
+            attempts,
+            policy_snapshot_id=self._policy_snapshot.id,
+            strategy_set=_fallback_strategy_set(self._fallback_strategies),
+        ):
+            return collection.state
 
         effective_tlp = max(
             (
@@ -2428,8 +2466,36 @@ class SubjectCollectionService:
                     else:
                         started = time.monotonic()
                         try:
+                            strategy_request = acquisition_request
+                            if acquisition_request.response_status in {
+                                401,
+                                403,
+                            } and strategy.method in {
+                                SourceAcquisitionMethod.PLAYWRIGHT_RENDERED,
+                                SourceAcquisitionMethod.PLAYWRIGHT_CHROMIUM_DOM,
+                                SourceAcquisitionMethod.PLAYWRIGHT_NETWORK_RESPONSE,
+                                SourceAcquisitionMethod.PLAYWRIGHT_EMBEDDED_STATE,
+                                SourceAcquisitionMethod.VISUAL_OCR,
+                            }:
+                                strategy_request = replace(strategy_request, response_body=None)
                             async with asyncio.timeout(float(strategy.timeout_seconds)):
-                                probes = tuple(await strategy.acquire(acquisition_request))
+                                probes = tuple(await strategy.acquire(strategy_request))
+                                if not probes:
+                                    probes = (
+                                        AcquisitionProbe(
+                                            strategy_name=strategy.name,
+                                            strategy_version=strategy.version,
+                                            method=strategy.method,
+                                            requested_url=fallback_requested_url,
+                                            outcome=AcquisitionOutcome.SKIPPED,
+                                            reason_code="strategy_returned_no_probes",
+                                            response=None,
+                                            http_status=None,
+                                            encoded_size=None,
+                                            encoded_sha256=None,
+                                            duration_ms=round((time.monotonic() - started) * 1000),
+                                        ),
+                                    )
                         except JobCancelledError:
                             raise
                         except TimeoutError:
@@ -2508,6 +2574,7 @@ class SubjectCollectionService:
             per_domain_concurrency=self._acquisition_per_domain_concurrency,
             domain_limiter=self._acquisition_domain_limiter,
         )
+        chain_started_at = datetime.now(UTC)
         result = await orchestrator.run(
             request,
             cancellation_check=context.check_cancelled if context is not None else None,
@@ -2534,6 +2601,17 @@ class SubjectCollectionService:
         for probe_id, probe in deferred_success_probes.items():
             if probe_id != id(result.winner) and probe_id not in handled_probe_ids:
                 await self._record_fallback_probe(collection.id, job_id, probe)
+
+        if result.winner is None and _fallback_chain_completed(
+            configured,
+            result,
+        ):
+            await self._record_fallback_chain_completion(
+                collection.id,
+                job_id,
+                _fallback_strategy_set(self._fallback_strategies),
+                started_at=chain_started_at,
+            )
 
         winner = result.winner
         if winner is not None and winner.response is not None:
@@ -3421,6 +3499,49 @@ class SubjectCollectionService:
             )
             await uow.commit()
 
+    async def _record_fallback_chain_completion(
+        self,
+        collection_id: UUID,
+        job_id: UUID,
+        strategy_set: tuple[tuple[str, str], ...],
+        *,
+        started_at: datetime,
+    ) -> None:
+        """Persist completion only after every configured strategy has returned."""
+        async with self._uow_factory() as uow:
+            collection = await uow.source_collections.get(collection_id)
+            if (
+                collection is None
+                or collection.state in (_COLLECTED_STATES | {CollectionState.FETCHING})
+                or collection.source_document_id is not None
+            ):
+                return
+            subject = await uow.subjects.get(collection.subject_id)
+            if subject is None:
+                return
+            await uow.provenance.append(
+                ProvenanceEvent(
+                    subject_id=collection.subject_id,
+                    aggregate_type="source_collection",
+                    aggregate_id=collection.id,
+                    event_type="source.acquisition_fallback_chain_completed",
+                    payload={
+                        "job_id": str(job_id),
+                        "policy_snapshot_id": self._policy_snapshot.id,
+                        "started_at": started_at.isoformat(),
+                        "strategy_set": [
+                            {"name": name, "version": version} for name, version in strategy_set
+                        ],
+                    },
+                    tlp=max(
+                        (subject.tlp, collection.source_tlp),
+                        key=lambda item: tuple(TLP).index(item),
+                    ),
+                    actor_id="system:acquisition_fallback",
+                )
+            )
+            await uow.commit()
+
     async def _record_fallback_skip(
         self,
         collection: SourceCollection,
@@ -3950,6 +4071,97 @@ async def _require_collection(uow: UnitOfWork, collection_id: UUID) -> SourceCol
     if collection is None:
         raise CollectionItemNotFoundError(str(collection_id))
     return collection
+
+
+def _fallback_strategy_set(
+    strategies: Sequence[AcquisitionStrategy],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            {
+                (strategy.name, strategy.version)
+                for strategy in strategies
+                if getattr(strategy, "enabled", True)
+            }
+        )
+    )
+
+
+def _fallback_chain_completed(
+    strategies: Sequence[AcquisitionStrategy],
+    result: AcquisitionRunResult,
+) -> bool:
+    if result.deadline_exceeded or any(
+        probe.reason_code in {"attempt_budget_exceeded", "global_deadline_exceeded"}
+        or probe.outcome is AcquisitionOutcome.NEEDS_RECONCILIATION
+        for probe in result.probes
+    ):
+        return False
+    required = {(strategy.name, strategy.version) for strategy in strategies}
+    completed = {
+        (probe.strategy_name, probe.strategy_version)
+        for probe in result.probes
+        if probe.strategy_name is not None and probe.strategy_version is not None
+    }
+    return required.issubset(completed)
+
+
+def _completed_fallback_chain_matches(
+    events: Sequence[ProvenanceEvent],
+    attempts: Sequence[CollectionAttempt],
+    *,
+    policy_snapshot_id: str,
+    strategy_set: tuple[tuple[str, str], ...],
+) -> bool:
+    completions = [
+        event
+        for event in events
+        if event.event_type == "source.acquisition_fallback_chain_completed"
+    ]
+    if not completions:
+        return False
+    latest = max(completions, key=lambda event: event.occurred_at)
+    payload = latest.payload if isinstance(latest.payload, dict) else {}
+    if payload.get("policy_snapshot_id") != policy_snapshot_id:
+        return False
+    raw_strategy_set = payload.get("strategy_set")
+    if not isinstance(raw_strategy_set, list):
+        return False
+    try:
+        completed_strategy_set = tuple(
+            sorted(
+                (
+                    str(item["name"]),
+                    str(item["version"]),
+                )
+                for item in raw_strategy_set
+                if isinstance(item, dict)
+            )
+        )
+        completion_job_id = UUID(str(payload["job_id"]))
+        chain_started_at = datetime.fromisoformat(str(payload["started_at"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if chain_started_at.tzinfo is None:
+        return False
+    if completed_strategy_set != strategy_set:
+        return False
+    latest_direct_attempt = max(
+        (attempt.completed_at for attempt in attempts if attempt.strategy_name is None),
+        default=None,
+    )
+    if latest_direct_attempt is not None and latest_direct_attempt >= chain_started_at:
+        return False
+    recorded_strategy_set = {
+        (attempt.strategy_name, attempt.strategy_version)
+        for attempt in attempts
+        if attempt.job_id == completion_job_id
+        and attempt.policy_snapshot_id == policy_snapshot_id
+        and attempt.strategy_name is not None
+        and attempt.strategy_version is not None
+        and attempt.completed_at > chain_started_at
+    }
+    return set(strategy_set).issubset(recorded_strategy_set)
 
 
 def _original_name(url: str) -> str:
