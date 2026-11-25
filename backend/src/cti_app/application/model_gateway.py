@@ -830,20 +830,13 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     value_sha256=digest,
                     raw_output_reference=reference,
                 )
-                rejections = getattr(uow, "model_output_rejections", None)
-                append_rejection = getattr(rejections, "append", None)
-                list_rejections = getattr(rejections, "list_for_run", None)
-                if callable(list_rejections):
-                    prior = await list_rejections(run_id)
-                    already_recorded = any(
-                        item.error_type == rejection.error_type
-                        and item.value_sha256 == rejection.value_sha256
-                        for item in prior
-                    )
-                else:
-                    already_recorded = False
-                if callable(append_rejection) and not already_recorded:
-                    await append_rejection(rejection)
+                already_recorded = any(
+                    item.error_type == rejection.error_type
+                    and item.value_sha256 == rejection.value_sha256
+                    for item in await uow.model_output_rejections.list_for_run(run_id)
+                )
+                if not already_recorded:
+                    await uow.model_output_rejections.append(rejection)
                     await uow.commit()
                 raise ModelRecoveryDiscardedError(
                     "Recovered output was recorded as a late response after the operator "

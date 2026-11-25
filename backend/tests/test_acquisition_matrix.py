@@ -718,7 +718,7 @@ def test_case_19_core_bridge_source_forces_review_without_article_promotion():
     extraction = replace(extraction, sources=(bridge_source,))
     decision = _inputs(extraction, _projection(extraction))
     assert decision.status is RoutingStatus.NEEDS_REVIEW
-    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_MISSING
+    assert decision.reason_code is RoutingReasonCode.CRITICAL_SOURCE_ALTERNATIVE_PROVENANCE
     assert decision.publication_kind is None
 
 
