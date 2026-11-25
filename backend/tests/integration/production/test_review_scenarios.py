@@ -12,6 +12,8 @@ from typing import Any
 
 import pytest
 
+from cti_app.application.production_jobs import stage_job_kind
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionRunStatus,
@@ -274,10 +276,10 @@ async def _fingerprint(scenario: ProductionScenario) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_redelivering_every_job_of_a_finished_run_changes_nothing(
+async def test_finished_extraction_and_assembly_job_replay_is_safe(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
-    """Replay and double finalisation: no new artifact, event, decision or external call."""
+    """Lost acknowledgements replay handlers without changing durable production state."""
     scenario = production_scenario_factory(_specs({S1: 200}, with_indicator=True))
     scenario.model.script.references(_references((S1,)))
     scenario.model.script.q2(source_url=S1, response=_q2_with_indicator(1))
@@ -293,14 +295,55 @@ async def test_redelivering_every_job_of_a_finished_run_changes_nothing(
     assert before["model_calls"] > 0
     assert before["decision"] is not None
 
-    jobs = sorted(
-        await scenario.jobs.list_for_aggregate("subject", scenario.subject.id),
-        key=lambda job: (job.created_at, job.id),
+    invariant_keys = (
+        "status",
+        "generation",
+        "artifacts",
+        "decision",
+        "provenance",
+        "model_calls",
+        "transport_requests",
     )
-    assert jobs
-    for _ in range(2):
-        for job in jobs:
-            await scenario.runner.dispatch(job.id)
-    await scenario.runner.run_until_idle()
+    expected_invariants = {key: before[key] for key in invariant_keys}
 
-    assert await _fingerprint(scenario) == before
+    for stage in (ProductionStage.EXTRACTION, ProductionStage.ASSEMBLY):
+        job = next(
+            job
+            for job in await scenario.jobs.list_for_aggregate("subject", scenario.subject.id)
+            if job.kind == stage_job_kind(stage)
+        )
+        assert job.status is JobStatus.SUCCEEDED
+        previous_attempt = job.attempt
+        previous_history = await scenario.jobs.history(job.id)
+        diagnostic_count = len(_diagnostic_events(scenario))
+
+        async with scenario.uow_factory() as uow:
+            queued = await uow.jobs.get_for_update(job.id)
+            assert queued is not None
+            assert queued.status is JobStatus.SUCCEEDED
+            queued.status = JobStatus.QUEUED
+            queued.finished_at = None
+            queued.next_retry_at = None
+            await uow.jobs.save(queued)
+            await uow.commit()
+
+        await scenario.runner.dispatch(job.id)
+        await scenario.runner.run_until_idle()
+
+        replayed = await scenario.jobs.get(job.id)
+        history = await scenario.jobs.history(job.id)
+        assert replayed.status is JobStatus.SUCCEEDED
+        assert replayed.attempt == previous_attempt + 1
+        new_events = history[len(previous_history) :]
+        assert any(event.event_type == "job.started" for event in new_events)
+        assert any(event.event_type == "job.succeeded" for event in new_events)
+
+        after = await _fingerprint(scenario)
+        assert {key: after[key] for key in invariant_keys} == expected_invariants
+        if stage is ProductionStage.ASSEMBLY:
+            diagnostics = _diagnostic_events(scenario)[diagnostic_count:]
+            assert any(
+                event.get("event") == "stage.outcome"
+                and event.get("stage") == ProductionStage.ASSEMBLY.value
+                for event in diagnostics
+            )
