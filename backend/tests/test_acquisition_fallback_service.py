@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -695,7 +696,7 @@ async def test_fallback_completion_marker_rechecks_capability_and_legacy_payload
 
 
 @pytest.mark.asyncio
-async def test_fallback_completion_marker_hashes_provider_credentials(tmp_path):
+async def test_fallback_completion_marker_records_token_presence_never_the_credential(tmp_path):
     factory, service, _subject, source, blob_store = await _service(
         tmp_path,
         transport=Transport(),
@@ -707,35 +708,40 @@ async def test_fallback_completion_marker_hashes_provider_credentials(tmp_path):
     source.failure_reason_code = CollectionFailureReason.HTTP_ERROR
     source.error_reason = "synthetic direct HTTP failure"
 
+    def service_with(token: str) -> SubjectCollectionService:
+        return SubjectCollectionService(
+            factory,
+            SafeHttpCollector(Transport(), Resolver(), CollectionPolicy()),
+            blob_store,
+            fallback_strategies=(FailedProbeStrategy(),),
+            third_party_provider_enabled=True,
+            third_party_provider_url="https://provider.example/extract",
+            third_party_provider_token=token,
+        )
+
+    def markers() -> list[Any]:
+        return [
+            event
+            for event in factory.provenance
+            if event.event_type == "source.acquisition_fallback_chain_completed"
+        ]
+
     await service._acquire_fallback_chain(source.id, uuid4(), None, explicit_request=True)
-    first_marker = next(
-        event
-        for event in factory.provenance
-        if event.event_type == "source.acquisition_fallback_chain_completed"
-    )
-    assert "synthetic-first-token" not in repr(first_marker.payload)
+    assert len(markers()) == 1
 
-    updated_service = SubjectCollectionService(
-        factory,
-        SafeHttpCollector(Transport(), Resolver(), CollectionPolicy()),
-        blob_store,
-        fallback_strategies=(FailedProbeStrategy(),),
-        third_party_provider_enabled=True,
-        third_party_provider_url="https://provider.example/extract",
-        third_party_provider_token="synthetic-second-token",
-    )
-    await updated_service._acquire_fallback_chain(source.id, uuid4(), None)
+    # Rotating the credential changes nothing the chain can reach: no replay.
+    await service_with("synthetic-second-token")._acquire_fallback_chain(source.id, uuid4(), None)
+    assert len(markers()) == 1
 
-    markers = [
-        event
-        for event in factory.provenance
-        if event.event_type == "source.acquisition_fallback_chain_completed"
-    ]
-    assert len(markers) == 2
+    # Removing the credential makes the provider unusable: the chain is re-evaluated.
+    await service_with("")._acquire_fallback_chain(source.id, uuid4(), None)
+    assert len(markers()) == 2
+
+    # No stored payload ever carries a credential value.
     assert all(
         token not in repr(event.payload)
         for token in ("synthetic-first-token", "synthetic-second-token")
-        for event in markers
+        for event in markers()
     )
 
 
