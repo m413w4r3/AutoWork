@@ -1243,6 +1243,88 @@ async def test_fetch_level_dns_and_timeout_retries_exhaust_after_three_attempts(
     )
 
 
+async def test_fetch_level_transient_retry_below_three_attempts_remains_retryable(
+    tmp_path: Path,
+) -> None:
+    class TimeoutTransport:
+        async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+            del request
+            raise DownloadTransientError(
+                "offline fake transient failure",
+                reason_code=CollectionFailureReason.TIMEOUT,
+                transport_classification=CollectionTransportClassification.TIMEOUT,
+            )
+
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://retry.example/report",))
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(TimeoutTransport(), Resolver()),
+        FilesystemBlobStore(tmp_path / "retry-blobs"),
+    )
+    source = (await app.initialize(subject.id))[0]
+
+    for attempt_number in range(2):
+        assert await app.archive_one(source.id, uuid4()) is CollectionState.FAILED_RETRYABLE
+        if attempt_number == 0:
+            await app.prepare_retry(source.id)
+
+    retry = await app.prepare_retry(source.id)
+
+    assert retry.state is CollectionState.PENDING
+    assert retry.failure_reason_code is None
+    assert len(await app.attempts(source.id)) == 2
+
+
+async def test_fetch_level_transient_attempts_under_old_policy_do_not_exhaust_new_policy(
+    tmp_path: Path,
+) -> None:
+    class TestResolver:
+        async def resolve(self, hostname: str) -> Sequence[str]:
+            del hostname
+            raise OSError("offline fake DNS failure")
+
+    class TimeoutTransport:
+        async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+            del request
+            raise AssertionError("DNS failure should happen before transport")
+
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://retry.example/report",))
+    transport = TimeoutTransport()
+    resolver = TestResolver()
+    blob_store = FilesystemBlobStore(tmp_path / "retry-blobs")
+    old_policy_app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(transport, resolver),
+        blob_store,
+    )
+    source = (await old_policy_app.initialize(subject.id))[0]
+
+    for attempt_number in range(3):
+        assert (
+            await old_policy_app.archive_one(source.id, uuid4()) is CollectionState.FAILED_RETRYABLE
+        )
+        if attempt_number < 2:
+            await old_policy_app.prepare_retry(source.id)
+
+    new_policy_app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(
+            transport,
+            resolver,
+            CollectionPolicy(allowed_domains=frozenset({"retry.example"})),
+        ),
+        blob_store,
+    )
+
+    retry = await new_policy_app.prepare_retry(source.id)
+
+    assert retry.state is CollectionState.PENDING
+    assert retry.failure_reason_code is None
+    assert len(await new_policy_app.attempts(source.id)) == 3
+
+
 async def test_html_served_for_pdf_url_is_archived_with_non_pdf_reason(tmp_path: Path) -> None:
     url = "https://example.test/advisory.pdf"
     body = b"<!doctype html><html><body>Temporary page</body></html>"
