@@ -580,7 +580,12 @@ def test_file_write_rechecks_secret_after_exposure_revocation(tmp_path: Path) ->
     supervisor._sessions = {SESSION_ID: handle}
     supervisor._lock = threading.RLock()
     supervisor._now = lambda: "synthetic-time"
-    supervisor._stop_channels = lambda target, *, wipe_secret: setattr(target, "secret_forms", ())
+
+    def stop_channels(target, *, wipe_secret, clear_forms=False) -> None:
+        if clear_forms:
+            target.secret_forms = ()
+
+    supervisor._stop_channels = stop_channels
     supervisor._persist = lambda *_args, **_kwargs: persisted.append(None)
 
     with pytest.raises(sessions_supervisor.SecretExposureError):

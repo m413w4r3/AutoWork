@@ -83,6 +83,7 @@ class SessionError(Exception):
 
     code: ErrorCode = ErrorCode.INTERNAL_ERROR
     status: int = 500
+    retryable = False
 
     def __init__(self, message: str, *, details: Mapping[str, object] | None = None) -> None:
         super().__init__(message)
@@ -167,6 +168,7 @@ class SessionWriteAdmissionError(SessionError):
 class SessionWriteDrainTimeoutError(SessionError):
     code = ErrorCode.SESSION_BUSY
     status = 409
+    retryable = True
 
     def __init__(
         self,

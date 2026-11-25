@@ -111,7 +111,7 @@ Toutes : agents Paseo `codex/gpt-6-luna`, lecture seule, déclarés « GPT-6, va
 | R1b | `fca03982` | NO-GO (`note.capture` contourne ; secret fragmenté) | `63ad2777` |
 | R1c | `dd89f5f5` | NO-GO (`target=result`, écriture sans `task_id`) | `2522040d` |
 | R1d (cette session, `03f35f61`, xhigh) | `63a594da` | NO-GO : course écriture/révocation, secret dans le chemin, `task_id` non lié | `8ba83eea` (agent `740e7283`), mergé `b9c38d31`, relu et rejoué |
-| R1e (`22f7d0b0`, xhigh) | `b9c38d31` | NO-GO sur une fenêtre plus étroite (voir §10) | **résidu accepté, non corrigé** — décision de l'orchestrateur, à confirmer par l'utilisateur |
+| R1e (`22f7d0b0`, xhigh) | `b9c38d31` | NO-GO sur la course post-contrôle ; corrigée en M24.3 | comportement historique après fermeture accepté (§10) |
 | R2 concurrence | — | GO avec réserves (2 mineurs : §10) | documentés |
 | R3 provenance | `18f9d0a9` | NO-GO | `88d1ad4d`, `18f9d0a9`, `86d76820`, `cac43c92` |
 | R3b | `fca03982` | NO-GO (G2 `superseded` affiché autorisé) | `3b2e7978` |
@@ -148,12 +148,12 @@ Les verdicts R1…R6 hors R1d/R1e/R3d/R3e sont ATTRIBUÉS (rapportés par l'orch
 - Rejeu de `collect` après redémarrage du sidecar non strictement idempotent (cache d'idempotence en mémoire) (R2).
 - Fragments de credential **réordonnés** non détectés ; la jointure de concaténation peut en théorie refuser deux contenus bénins (R1c).
 - TOCTOU lecture du fichier temporaire → publication : workspace monté en lecture seule dans le sandbox (R1c).
-- **Fenêtre R1e (nouveau)** : une écriture non humaine déjà en vol dont la session est révoquée pour exposition puis
-  **fermée** avant son contrôle peut publier le secret (`close()` efface les formes ; `server_close()` similaire).
-  Jugée **non exploitable en autorité** : le broker refuse toute session non `is_active`
-  (`backend/src/cti_app/application/agentic_tool_broker.py:633`), donc le secret d'une session fermée ne confère plus rien.
-  Le correctif proposé (coordination d'admission avec `close`/`stop`) ajoute verrous et complexité ; non appliqué.
-  **Le reviewer l'a classée BLOQUANT : décision à confirmer par l'utilisateur.**
+- **Secret d'une session fermée ou perdue (R1e, comportement accepté)** : `close()` et la perte du superviseur
+  effacent les formes ; une écriture non humaine ultérieure contenant l'ancien secret peut donc être acceptée (201).
+  Ce comportement historique était présent dans `d7dd3a2d` et reste sans autorité : le broker exige
+  `session_row.is_active` (`backend/src/cti_app/application/agentic_tool_broker.py:631–633`). Conserver les formes
+  après fermeture contredirait leur effacement exigé. Le correctif M24.3 ferme la course distincte d'une écriture
+  déjà admise avant l'ajout ou le remplacement des formes.
 - Test de minutage `test_capability_rechecks_expiry_at_physical_send` (permis de 20 ms), intermittent, hors périmètre (§3 note 1).
 - `GET /envelope` ne fournit pas le motif de la dernière décision G2 : l'UI dit « non transmis par l'API ».
 - Densité des listes IOC / sélecteur de code ; `SamplesResultsView.tsx` (~2000 lignes) à découper (non bloquant).

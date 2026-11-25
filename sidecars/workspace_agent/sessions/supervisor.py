@@ -1473,6 +1473,7 @@ class SessionSupervisor:
         with self._workspace_write_condition:
             self._workspace_write_condition.notify_all()
 
+        # The 5 s bound covers write-lease draining, not channel or process cleanup.
         deadline = time.monotonic() + WRITE_DRAIN_TIMEOUT_SECONDS
         by_workspace: dict[str, list[_Session]] = {}
         for handle in handles:
@@ -1537,7 +1538,11 @@ class SessionSupervisor:
                         except OSError:
                             pass
                     try:
-                        self._purge_provider_credentials(handle, operation="stop")
+                        self._purge_provider_credentials(
+                            handle,
+                            operation="stop",
+                            capture_forms=record.workspace_id in drained_workspaces,
+                        )
                     except SessionError:
                         pass
                     if record.workspace_id in drained_workspaces:
@@ -1907,6 +1912,19 @@ class SessionSupervisor:
     def prepare(
         self, request: PrepareSessionRequest, *, idempotency_key: str, body_sha256: str
     ) -> dict[str, object]:
+        if self._stopped.is_set():
+            raise SessionWriteAdmissionError("prepare", request.workspace_id)
+        return self._with_workspace_form_update(
+            request.workspace_id,
+            "prepare",
+            lambda: self._prepare_after_workspace_form_gate(
+                request, idempotency_key=idempotency_key, body_sha256=body_sha256
+            ),
+        )
+
+    def _prepare_after_workspace_form_gate(
+        self, request: PrepareSessionRequest, *, idempotency_key: str, body_sha256: str
+    ) -> dict[str, object]:
         with self._lock:
             if self._stopped.is_set():
                 raise SessionWriteAdmissionError("prepare", request.workspace_id)
@@ -2178,10 +2196,31 @@ class SessionSupervisor:
         body_sha256: str,
     ) -> dict[str, object]:
         handle = self._handle(session_id)
+        if self._stopped.is_set():
+            raise SessionWriteAdmissionError("start", handle.record.workspace_id)
+        return self._with_workspace_form_update(
+            handle.record.workspace_id,
+            "start",
+            lambda: self._start_after_workspace_form_gate(
+                handle,
+                request,
+                idempotency_key=idempotency_key,
+                body_sha256=body_sha256,
+            ),
+        )
+
+    def _start_after_workspace_form_gate(
+        self,
+        handle: _Session,
+        request: StartSessionRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
         with handle.lock:
             if self._stopped.is_set():
                 raise SessionWriteAdmissionError("start", handle.record.workspace_id)
-            scope = f"{session_id}:start"
+            scope = f"{handle.record.session_id}:start"
             replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
             if replay is not None:
                 return replay[1]
@@ -2193,7 +2232,7 @@ class SessionSupervisor:
                 SessionState.PROVISIONING,
                 SessionState.RECONCILING,
             }:
-                raise SessionBusyError(session_id)
+                raise SessionBusyError(handle.record.session_id)
             if record.state in {
                 SessionState.LOST,
                 SessionState.CLOSED,
@@ -2216,10 +2255,31 @@ class SessionSupervisor:
         body_sha256: str,
     ) -> dict[str, object]:
         handle = self._handle(session_id)
+        if self._stopped.is_set():
+            raise SessionWriteAdmissionError("resume", handle.record.workspace_id)
+        return self._with_workspace_form_update(
+            handle.record.workspace_id,
+            "resume",
+            lambda: self._resume_after_workspace_form_gate(
+                handle,
+                request,
+                idempotency_key=idempotency_key,
+                body_sha256=body_sha256,
+            ),
+        )
+
+    def _resume_after_workspace_form_gate(
+        self,
+        handle: _Session,
+        request: ResumeRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
         with handle.lock:
             if self._stopped.is_set():
                 raise SessionWriteAdmissionError("resume", handle.record.workspace_id)
-            scope = f"{session_id}:resume"
+            scope = f"{handle.record.session_id}:resume"
             replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
             if replay is not None:
                 return replay[1]
@@ -2534,10 +2594,22 @@ class SessionSupervisor:
         for thread in list(handle.threads):
             if thread.name.startswith(("session-stdout", "session-stderr")):
                 thread.join(timeout=2)
-        with handle.lock:
-            if handle.managed is not managed:
+        while not self._stopped.is_set():
+            workspace_id = handle.record.workspace_id
+            if not self._acquire_workspace_write_exclusive(
+                workspace_id, WRITE_DRAIN_TIMEOUT_SECONDS
+            ):
+                continue
+            try:
+                if self._stopped.is_set():
+                    return
+                with handle.lock:
+                    if handle.managed is not managed:
+                        return
+                    self._finalize_exit(handle, managed, code)
                 return
-            self._finalize_exit(handle, managed, code)
+            finally:
+                self._release_workspace_write_exclusive(workspace_id)
 
     def _finalize_exit(self, handle: _Session, managed: process.ManagedProcess, code: int) -> None:
         if self._stopped.is_set():
@@ -2693,8 +2765,27 @@ class SessionSupervisor:
         supervisor restart, is a typed refusal with no effect.
         """
         handle = self._handle(session_id)
+        return self._with_workspace_form_update(
+            handle.record.workspace_id,
+            "instruction",
+            lambda: self._instruction_after_workspace_form_gate(
+                handle,
+                request,
+                idempotency_key=idempotency_key,
+                body_sha256=body_sha256,
+            ),
+        )
+
+    def _instruction_after_workspace_form_gate(
+        self,
+        handle: _Session,
+        request: InstructionRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
         with handle.lock:
-            scope = f"{session_id}:instruction"
+            scope = f"{handle.record.session_id}:instruction"
             replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
             if replay is not None:
                 return replay[1]
@@ -2794,8 +2885,27 @@ class SessionSupervisor:
         body_sha256: str,
     ) -> dict[str, object]:
         handle = self._handle(session_id)
+        return self._with_workspace_form_update(
+            handle.record.workspace_id,
+            "interrupt",
+            lambda: self._interrupt_after_workspace_form_gate(
+                handle,
+                request,
+                idempotency_key=idempotency_key,
+                body_sha256=body_sha256,
+            ),
+        )
+
+    def _interrupt_after_workspace_form_gate(
+        self,
+        handle: _Session,
+        request: ReasonRequest,
+        *,
+        idempotency_key: str,
+        body_sha256: str,
+    ) -> dict[str, object]:
         with handle.lock:
-            scope = f"{session_id}:interrupt"
+            scope = f"{handle.record.session_id}:interrupt"
             replay = self._idempotency.replay(scope, idempotency_key, body_sha256)
             if replay is not None:
                 return replay[1]
@@ -3290,6 +3400,19 @@ class SessionSupervisor:
             self._workspace_write_condition.notify_all()
             self._prune_workspace_write_gate(workspace_id, gate)
 
+    def _with_workspace_form_update(
+        self,
+        workspace_id: str,
+        operation: str,
+        action: Callable[[], dict[str, object]],
+    ) -> dict[str, object]:
+        if not self._acquire_workspace_write_exclusive(workspace_id, WRITE_DRAIN_TIMEOUT_SECONDS):
+            raise SessionWriteDrainTimeoutError(operation, workspace_id=workspace_id)
+        try:
+            return action()
+        finally:
+            self._release_workspace_write_exclusive(workspace_id)
+
     def _prune_workspace_write_gate(self, workspace_id: str, gate: _WorkspaceWriteGate) -> None:
         if (
             gate.readers == 0
@@ -3339,10 +3462,8 @@ class SessionSupervisor:
         record = handle.record
         if record.state is SessionState.FAILED and record.outcome == SECRET_EXPOSURE_REASON:
             return
-        secret_forms = handle.secret_forms
         self._stop_channels(handle, wipe_secret=True)
-        # Revocation wipes the raw secret but keeps the forms for later writes.
-        handle.secret_forms = secret_forms
+        # Revocation wipes the raw secret but leaves the forms for later writes.
         previous = record.state
         now = self._now()
         record.state = SessionState.FAILED
@@ -3365,7 +3486,9 @@ class SessionSupervisor:
 
     # -- provider credential copies (R2B-1) --------------------------------
 
-    def _purge_provider_credentials(self, handle: _Session, *, operation: str) -> None:
+    def _purge_provider_credentials(
+        self, handle: _Session, *, operation: str, capture_forms: bool = True
+    ) -> None:
         """Shred and unlink the credential copies seeded for this session.
 
         The values are captured in memory first so a later ``collect`` still
@@ -3375,7 +3498,8 @@ class SessionSupervisor:
         session be reused.
         """
         forms, failures = _remove_profile_credentials(handle.directory)
-        handle.provider_credential_forms = _merge_forms(handle.provider_credential_forms, forms)
+        if capture_forms:
+            handle.provider_credential_forms = _merge_forms(handle.provider_credential_forms, forms)
         if failures:
             self._fail_credential_cleanup(handle, operation)
             raise CredentialCleanupError(operation=operation)
@@ -3538,6 +3662,7 @@ class SessionSupervisor:
                 # A copy that cannot be removed fails this close (state ``failed``)
                 # instead of leaving a reusable credential behind a clean receipt.
                 self._purge_provider_credentials(handle, operation="close")
+                # M24-2 §10: a closed session no longer protects its old secret forms.
                 handle.secret_forms = ()
                 handle.provider_credential_forms = ()
                 now = self._now()

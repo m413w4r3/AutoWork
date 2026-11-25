@@ -453,7 +453,13 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             workspace.WorkspaceError,
             paths.WorkspacePathError,
         ) as exc:
-            raise _RequestRejected(exc.status, exc.code, exc.message, details=exc.details) from exc
+            raise _RequestRejected(
+                exc.status,
+                exc.code,
+                exc.message,
+                retryable=getattr(exc, "retryable", False),
+                details=exc.details,
+            ) from exc
         return 501, protocol.error_envelope(
             protocol.ErrorCode.NOT_IMPLEMENTED, "operation not implemented yet"
         )
@@ -590,7 +596,13 @@ class WorkspaceAgentRequestHandler(BaseHTTPRequestHandler):
             workspace.WorkspaceError,
             paths.WorkspacePathError,
         ) as exc:
-            raise _RequestRejected(exc.status, exc.code, exc.message, details=exc.details) from exc
+            raise _RequestRejected(
+                exc.status,
+                exc.code,
+                exc.message,
+                retryable=getattr(exc, "retryable", False),
+                details=exc.details,
+            ) from exc
 
     def _handle_ensure(self, declared_length: int) -> tuple[int, dict[str, object]]:
         raw = self._read_body(declared_length)
