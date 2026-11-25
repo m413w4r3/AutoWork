@@ -124,6 +124,71 @@ function status(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("SubjectProduction retry from stage", () => {
+  it.each([
+    "publication_routing_needs_review",
+    "brief_chronology_unavailable",
+    "model_submission_reconciliation_required",
+  ])("ne propose pas de retry générique pour %s", async (errorCode) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("needs_review"),
+          error_code: errorCode,
+        }),
+      ),
+    );
+    renderProduction();
+
+    await screen.findByText("TAG-182 et MarkiRAT");
+    expect(
+      screen.queryByRole("button", { name: "Relancer cette étape" }),
+    ).toBeNull();
+    expect(
+      screen.queryByText("Relancer depuis une étape précédente"),
+    ).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+  });
+
+  it.each([
+    ["synthesis_output_invalid", /sortie de synthèse a été rejetée/i],
+    [
+      "synthesis_correction_context_too_large",
+      /correction de la synthèse a été rejetée.*contexte/i,
+    ],
+  ])(
+    "explique l’erreur %s et borne la correction à un tour",
+    async (errorCode, message) => {
+      const user = userEvent.setup();
+      const base = status("needs_review", "synthesis");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          Response.json({
+            ...base,
+            error_code: errorCode,
+            stages: {
+              ...base.stages,
+              synthesis: {
+                status: "needs_review",
+                version: null,
+                error_code: errorCode,
+                error_message: null,
+              },
+            },
+          }),
+        ),
+      );
+      renderProduction();
+
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(message);
+      expect(alert).toHaveTextContent(/une seule.*correction.*tour/i);
+      await user.click(screen.getByText("Détail diagnostic"));
+      expect(alert).toHaveTextContent(`Code : ${errorCode}`);
+    },
+  );
+
   it("place le lien de l’atelier près de l’aperçu publié", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url =

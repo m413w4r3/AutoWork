@@ -59,6 +59,26 @@ export function productionErrorMessage(
   return error instanceof Error ? error.message : fallback;
 }
 
+/** Operator-facing explanation for a production run requiring intervention. */
+export function productionIssueMessage(
+  errorCode: string | null,
+): string | null {
+  switch (errorCode) {
+    case "publication_routing_needs_review":
+      return "Le routage de publication est bloqué : consultez le diagnostic des sources avant de poursuivre.";
+    case "brief_chronology_unavailable":
+      return "La chronologie de la brève est indisponible : une acquisition de source datée est nécessaire.";
+    case "synthesis_output_invalid":
+      return "La sortie de synthèse a été rejetée par les contrôles. Une seule tentative de correction a été effectuée, limitée à un tour.";
+    case "synthesis_correction_context_too_large":
+      return "La correction de la synthèse a été rejetée car son contexte dépassait la limite autorisée. Une seule tentative de correction est permise, sur un tour.";
+    case "model_submission_reconciliation_required":
+      return "La soumission du modèle doit être réconciliée avant de poursuivre.";
+    default:
+      return null;
+  }
+}
+
 /** Retry only transport failures: a refusal answers the same way every time. */
 export function retryTransientProductionFailure(
   failureCount: number,

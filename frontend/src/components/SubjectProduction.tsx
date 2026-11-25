@@ -27,6 +27,7 @@ import {
   STAGE_LABELS,
   STATUS_LABELS,
   productionErrorMessage,
+  productionIssueMessage,
   retryTransientProductionFailure,
 } from "../features/production/productionLabels";
 import { RETRYABLE_PRODUCTION_STAGES } from "../features/production/productionStages";
@@ -76,6 +77,12 @@ const CONVERSATION_ERROR_CODES = new Set([
   "conversation_unavailable",
   "conversation_profile_mismatch",
   "conversation_busy",
+]);
+
+const RETRY_BLOCKED_ERROR_CODES = new Set([
+  "publication_routing_needs_review",
+  "brief_chronology_unavailable",
+  "model_submission_reconciliation_required",
 ]);
 
 function stageDetail(
@@ -131,6 +138,8 @@ function issueCopy(
   errorCode: string | null,
   blockingSourceCount: number,
 ): string {
+  const specificMessage = productionIssueMessage(errorCode);
+  if (specificMessage) return specificMessage;
   if (errorCode === "imported_production_state") {
     return "État restauré — références, extraction et synthèse sont disponibles. L’assemblage n’a pas été rejoué.";
   }
@@ -387,16 +396,20 @@ export function SubjectProduction({
     status.error_code === "model_submission_reconciliation_required" &&
     status.reconciliation !== null &&
     status.reconciliation !== undefined;
+  const retryBlockedByErrorCode = RETRY_BLOCKED_ERROR_CODES.has(
+    status.error_code ?? issueCode ?? "",
+  );
   // An unresolved provider submission owns the only recovery gesture: the
   // backend refuses every retry until the exact answer is adopted, so no
   // generic retry control — current stage or earlier — is offered here.
-  const retryStages: readonly RetryStage[] = reconciliationRequired
-    ? []
-    : status.status === "ready"
-      ? RETRYABLE_PRODUCTION_STAGES
-      : showIssue && issueStageIndex >= 0
-        ? RETRYABLE_PRODUCTION_STAGES.slice(0, issueStageIndex + 1)
-        : [];
+  const retryStages: readonly RetryStage[] =
+    reconciliationRequired || retryBlockedByErrorCode
+      ? []
+      : status.status === "ready"
+        ? RETRYABLE_PRODUCTION_STAGES
+        : showIssue && issueStageIndex >= 0
+          ? RETRYABLE_PRODUCTION_STAGES.slice(0, issueStageIndex + 1)
+          : [];
   const issueRetryStage = showIssue ? status.current_stage : null;
   const currentStageRetryRecommended = status.recovery_disposition === "auto";
 
@@ -476,31 +489,34 @@ export function SubjectProduction({
             {" — "}
             {issueCopy(status.status, issueCode, blockingSources.length)}
           </p>
-          {blockingSources.length > 0 ? (
-            <ul aria-label="Sources responsables">
-              {blockingSources.map((source) => (
-                <li key={source.sourceId}>
-                  {source.title ? <strong>{source.title}</strong> : null}
-                  {source.url ? (
-                    <>
-                      {source.title ? <br /> : null}
-                      <a href={source.url}>{source.url}</a>
-                    </>
-                  ) : (
-                    <strong>{source.sourceId}</strong>
-                  )}
-                  {source.errorCode ? (
-                    <>
-                      <br />
-                      <code>{source.errorCode}</code>
-                    </>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          ) : null}
-          <p>Code : {issueCode ?? "inconnu"}</p>
-          {issueMessage ? <p>{issueMessage}</p> : null}
+          <details>
+            <summary>Détail diagnostic</summary>
+            {blockingSources.length > 0 ? (
+              <ul aria-label="Sources responsables">
+                {blockingSources.map((source) => (
+                  <li key={source.sourceId}>
+                    {source.title ? <strong>{source.title}</strong> : null}
+                    {source.url ? (
+                      <>
+                        {source.title ? <br /> : null}
+                        <a href={source.url}>{source.url}</a>
+                      </>
+                    ) : (
+                      <strong>{source.sourceId}</strong>
+                    )}
+                    {source.errorCode ? (
+                      <>
+                        <br />
+                        <code>{source.errorCode}</code>
+                      </>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <p>Code : {issueCode ?? "inconnu"}</p>
+            {issueMessage ? <p>{issueMessage}</p> : null}
+          </details>
           <a href={stageArtifactHref(subjectId, status.current_stage)}>
             Voir les détails de l’étape
           </a>
